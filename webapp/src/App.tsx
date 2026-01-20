@@ -1494,8 +1494,15 @@ function extractErrorMessage(body: string, status: number) {
   }
   try {
     const parsed = JSON.parse(body) as { error?: string; message?: string; detail?: string };
-    return parsed.error || parsed.message || parsed.detail || `X API error (${status}).`;
+    const detail = parsed.error || parsed.message || parsed.detail;
+    if (status === 402 && detail) {
+      return `${detail} Add credits in the X developer portal.`;
+    }
+    return detail || `X API error (${status}).`;
   } catch {
+    if (status === 402) {
+      return "X API credits depleted. Add credits in the X developer portal.";
+    }
     return body.length > 140 ? `${body.slice(0, 140)}…` : body;
   }
 }
