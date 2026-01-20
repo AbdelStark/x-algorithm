@@ -1,0 +1,15 @@
+[package]
+name = "virality-sim"
+version = "0.1.0"
+edition = "2021"
+description = "Tweet virality simulator CLI"
+
+[dependencies]
+axum = "0.7"
+clap = { version = "4.5.21", features = ["derive"] }
+dotenvy = "0.15"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.38", features = ["rt-multi-thread", "macros"] }
+tower-http = { version = "0.5", features = ["fs"] }
