@@ -149,6 +149,7 @@ const DEFAULT_FORM: FormState = {
 const INITIAL_ACTIVITY: ActivityStep[] = [
   { label: "Preparing prompt", status: "pending" },
   { label: "Calling Grok API", status: "pending" },
+  { label: "Streaming response", status: "pending" },
   { label: "Merging signals", status: "pending" },
 ];
 
@@ -161,14 +162,18 @@ function App() {
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [snapshots, setSnapshots] = useState<Snapshot[]>([]);
   const [liveTranscript, setLiveTranscript] = useState("");
+  const [livePrompt, setLivePrompt] = useState("");
+  const [progressMessage, setProgressMessage] = useState<string | null>(null);
   const [activeSnapshotId, setActiveSnapshotId] = useState<string | null>(null);
   const [compareLeftId, setCompareLeftId] = useState<string | null>(null);
   const [compareRightId, setCompareRightId] = useState<string | null>(null);
   const eventSourceRef = useRef<EventSource | null>(null);
 
   const charCount = form.text.length;
-  const transcriptText = result.llmTrace?.raw_response || liveTranscript;
-  const promptText = result.llmTrace?.prompt || result.llmTrace?.prompt_summary || "";
+  const transcriptText = loading ? liveTranscript : result.llmTrace?.raw_response || liveTranscript;
+  const promptText = loading
+    ? livePrompt
+    : result.llmTrace?.prompt || livePrompt || result.llmTrace?.prompt_summary || "";
   const compareLeft = useMemo(
     () => snapshots.find((item) => item.id === compareLeftId) ?? null,
     [snapshots, compareLeftId]
@@ -244,6 +249,8 @@ function App() {
     setAlerts([]);
     setActiveSnapshotId(null);
     setLiveTranscript("");
+    setLivePrompt("");
+    setProgressMessage(null);
     if (!form.text.trim()) {
       setAlerts(["Add tweet text to simulate."]);
       return;
@@ -252,6 +259,7 @@ function App() {
     if (!form.useAi) {
       closeStream();
       setLoading(false);
+      setProgressMessage(null);
       const local = simulateLocal(form);
       setResult(local);
       setActivity(INITIAL_ACTIVITY);
@@ -261,9 +269,11 @@ function App() {
 
     const requestId = generateRequestId();
     setLoading(true);
+    setProgressMessage("Preparing Grok...");
     setActivity([
       { label: "Preparing prompt", status: "active" },
       { label: "Calling Grok API", status: "pending" },
+      { label: "Streaming response", status: "pending" },
       { label: "Merging signals", status: "pending" },
     ]);
     appendLog("start", `Simulation ${requestId} started`);
@@ -301,9 +311,11 @@ function App() {
         setActivity([
           { label: "Preparing prompt", status: "done" },
           { label: "Calling Grok API", status: "error" },
+          { label: "Streaming response", status: "pending" },
           { label: "Merging signals", status: "pending" },
         ]);
         setLoading(false);
+        setProgressMessage(null);
         closeStream();
         return;
       }
@@ -321,9 +333,11 @@ function App() {
       setActivity([
         { label: "Preparing prompt", status: "done" },
         { label: "Calling Grok API", status: "error" },
+        { label: "Streaming response", status: "pending" },
         { label: "Merging signals", status: "pending" },
       ]);
       setLoading(false);
+      setProgressMessage(null);
       closeStream();
     }
   };
@@ -361,6 +375,8 @@ function App() {
     setResult(snapshot.output);
     setActiveSnapshotId(snapshot.id);
     setLiveTranscript("");
+    setLivePrompt("");
+    setProgressMessage(null);
     setActivity(INITIAL_ACTIVITY);
     setLoading(false);
     closeStream();
@@ -436,6 +452,8 @@ function App() {
       setResult(snapshot.output);
       setActiveSnapshotId(snapshot.id);
       setLiveTranscript("");
+      setLivePrompt("");
+      setProgressMessage(null);
       setActivity(INITIAL_ACTIVITY);
       setLoading(false);
       closeStream();
@@ -480,17 +498,32 @@ function App() {
       <div className="main-grid">
         <section className="panel inputs">
           <div className="panel-header">
-            <h2>Tweet inputs</h2>
-            <label className="toggle">
-              <input
-                type="checkbox"
-                checked={form.useAi}
-                onChange={(event) =>
-                  setForm({ ...form, useAi: event.target.checked })
-                }
-              />
-              <span>Use Grok analysis</span>
-            </label>
+            <div className="panel-title">
+              <h2>Tweet inputs</h2>
+              <p className="panel-subhead">Draft your tweet and tune the ranking inputs.</p>
+            </div>
+            <div className="panel-actions">
+              <label className="toggle">
+                <input
+                  type="checkbox"
+                  checked={form.useAi}
+                  onChange={(event) =>
+                    setForm({ ...form, useAi: event.target.checked })
+                  }
+                />
+                <span>Use Grok analysis</span>
+              </label>
+              <button className="primary" onClick={handleSimulate} disabled={loading}>
+                {loading ? <span className="spinner" /> : "Simulate"}
+              </button>
+              <span className="hint">
+                {loading
+                  ? "Grok is analyzing your tweet..."
+                  : form.useAi
+                    ? "Requires local server + XAI_API_KEY"
+                    : "Local heuristic simulation"}
+              </span>
+            </div>
           </div>
 
           <div className="compose">
@@ -501,7 +534,7 @@ function App() {
             />
             <div className="compose-meta">
               <span>{charCount} chars</span>
-              <span>AI mode requires local server</span>
+              <span>Target 80-200 chars for strong hooks</span>
             </div>
           </div>
 
@@ -646,16 +679,6 @@ function App() {
             />
           </div>
 
-          <div className="compose-actions">
-            <button className="primary" onClick={handleSimulate} disabled={loading}>
-              {loading ? <span className="spinner" /> : "Simulate"}
-            </button>
-            <p className="hint">
-              {loading
-                ? "Grok is analyzing your tweet..."
-                : "Run locally or use Grok for deeper analysis."}
-            </p>
-          </div>
         </section>
 
         <section className="panel score">
@@ -731,6 +754,7 @@ function App() {
                 {loading ? "Running" : "Idle"}
               </span>
             </div>
+            {progressMessage && <p className="progress-message">{progressMessage}</p>}
             <ul className="activity">
               {activity.map((step) => (
                 <li key={step.label} className={step.status}>
@@ -769,7 +793,9 @@ function App() {
                 {promptText ? (
                   <pre>{promptText}</pre>
                 ) : (
-                  <p className="muted">No prompt captured yet.</p>
+                  <p className="muted">
+                    {loading ? "Building prompt..." : "No prompt captured yet."}
+                  </p>
                 )}
               </div>
               <div>
@@ -777,7 +803,9 @@ function App() {
                 {transcriptText ? (
                   <pre>{transcriptText}</pre>
                 ) : (
-                  <p className="muted">No response yet.</p>
+                  <p className="muted">
+                    {loading ? "Waiting for Grok tokens..." : "No response yet."}
+                  </p>
                 )}
               </div>
             </div>
@@ -954,6 +982,18 @@ function App() {
         };
         if (data.event === "token") {
           appendToken(data.message);
+          handleStreamEvent(data.event);
+          return;
+        }
+        if (data.event === "prompt") {
+          setLivePrompt(data.message);
+          appendLog("prompt", "Prompt prepared");
+          handleStreamEvent(data.event);
+          return;
+        }
+        if (data.event === "progress") {
+          setProgressMessage(data.message);
+          handleStreamEvent(data.event);
           return;
         }
         appendLog(data.event, data.message, data.timestamp_ms);
@@ -981,17 +1021,38 @@ function App() {
     if (event === "connected") {
       return;
     }
-    if (event === "token") {
+    if (event === "start") {
+      setActivity([
+        { label: "Preparing prompt", status: "active" },
+        { label: "Calling Grok API", status: "pending" },
+        { label: "Streaming response", status: "pending" },
+        { label: "Merging signals", status: "pending" },
+      ]);
       return;
     }
-    if (event === "start") {
-      updateActivity(0, "active");
+    if (event === "prompt") {
+      setActivity([
+        { label: "Preparing prompt", status: "done" },
+        { label: "Calling Grok API", status: "active" },
+        { label: "Streaming response", status: "pending" },
+        { label: "Merging signals", status: "pending" },
+      ]);
       return;
     }
     if (event === "calling") {
       setActivity([
         { label: "Preparing prompt", status: "done" },
         { label: "Calling Grok API", status: "active" },
+        { label: "Streaming response", status: "pending" },
+        { label: "Merging signals", status: "pending" },
+      ]);
+      return;
+    }
+    if (event === "progress" || event === "token") {
+      setActivity([
+        { label: "Preparing prompt", status: "done" },
+        { label: "Calling Grok API", status: "done" },
+        { label: "Streaming response", status: "active" },
         { label: "Merging signals", status: "pending" },
       ]);
       return;
@@ -1000,7 +1061,8 @@ function App() {
       setActivity([
         { label: "Preparing prompt", status: "done" },
         { label: "Calling Grok API", status: "done" },
-        { label: "Merging signals", status: "active" },
+        { label: "Streaming response", status: "done" },
+        { label: "Merging signals", status: "pending" },
       ]);
       return;
     }
@@ -1008,6 +1070,7 @@ function App() {
       setActivity([
         { label: "Preparing prompt", status: "done" },
         { label: "Calling Grok API", status: "done" },
+        { label: "Streaming response", status: "done" },
         { label: "Merging signals", status: "active" },
       ]);
       return;
@@ -1016,9 +1079,11 @@ function App() {
       setActivity([
         { label: "Preparing prompt", status: "done" },
         { label: "Calling Grok API", status: "done" },
+        { label: "Streaming response", status: "done" },
         { label: "Merging signals", status: "done" },
       ]);
       setLoading(false);
+      setProgressMessage(null);
       closeStream();
       return;
     }
@@ -1026,9 +1091,11 @@ function App() {
       setActivity([
         { label: "Preparing prompt", status: "done" },
         { label: "Calling Grok API", status: "error" },
+        { label: "Streaming response", status: "pending" },
         { label: "Merging signals", status: "pending" },
       ]);
       setLoading(false);
+      setProgressMessage(null);
       closeStream();
     }
   }
@@ -1052,11 +1119,6 @@ function App() {
     });
   }
 
-  function updateActivity(index: number, status: ActivityStep["status"]) {
-    setActivity((prev) =>
-      prev.map((step, i) => (i === index ? { ...step, status } : step))
-    );
-  }
 }
 
 function Field({ label, children }: { label: string; children: ReactNode }) {

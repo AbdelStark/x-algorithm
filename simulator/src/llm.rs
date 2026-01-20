@@ -148,23 +148,16 @@ impl LlmClient {
             let chunk = chunk.map_err(|err| format!("xAI stream failed: {}", err))?;
             let text_chunk = String::from_utf8_lossy(&chunk);
             buffer.push_str(&text_chunk);
+            if buffer.contains("\r\n") {
+                buffer = buffer.replace("\r\n", "\n");
+            }
 
-            while let Some(pos) = buffer.find('\n') {
-                let line = buffer[..pos].trim_end_matches('\r').to_string();
-                buffer = buffer[pos + 1..].to_string();
-                let line = line.trim();
-                if !line.starts_with("data:") {
-                    continue;
-                }
-                let data = line.trim_start_matches("data:").trim();
-                if data.is_empty() {
-                    continue;
-                }
+            for data in drain_sse_events(&mut buffer) {
                 if data == "[DONE]" {
                     break 'outer;
                 }
 
-                let event: ChatStreamResponse = serde_json::from_str(data)
+                let event: ChatStreamResponse = serde_json::from_str(&data)
                     .map_err(|err| format!("xAI stream parse failed: {}", err))?;
                 if let Some(model_value) = event.model {
                     model = Some(model_value);
@@ -302,6 +295,11 @@ fn build_messages(text: &str) -> (Vec<ChatMessage>, String) {
     (messages, prompt)
 }
 
+pub fn prompt_for_text(text: &str) -> String {
+    let (_, prompt) = build_messages(text);
+    prompt
+}
+
 fn parse_score(content: &str) -> Result<LlmScore, String> {
     let json = extract_json(content).ok_or_else(|| "xAI response missing JSON".to_string())?;
     let mut score: LlmScore = serde_json::from_str(&json)
@@ -322,6 +320,28 @@ fn parse_score(content: &str) -> Result<LlmScore, String> {
         .collect();
 
     Ok(score)
+}
+
+fn drain_sse_events(buffer: &mut String) -> Vec<String> {
+    let mut events = Vec::new();
+    loop {
+        let Some(idx) = buffer.find("\n\n") else {
+            break;
+        };
+        let block = buffer[..idx].to_string();
+        *buffer = buffer[idx + 2..].to_string();
+        let mut data_lines = Vec::new();
+        for line in block.lines() {
+            let line = line.trim_end_matches('\r');
+            if let Some(data) = line.strip_prefix("data:") {
+                data_lines.push(data.trim_start().to_string());
+            }
+        }
+        if !data_lines.is_empty() {
+            events.push(data_lines.join("\n"));
+        }
+    }
+    events
 }
 
 fn extract_json(text: &str) -> Option<String> {

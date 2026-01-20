@@ -14,7 +14,7 @@ use std::{
     net::SocketAddr,
     path::PathBuf,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -24,7 +24,7 @@ use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 use tower_http::services::{ServeDir, ServeFile};
 
 use crate::api::{ApiSimulationRequest, ApiSimulationResponse};
-use crate::llm::LlmClient;
+use crate::llm::{prompt_for_text, LlmClient};
 use crate::snapshots::{Snapshot, SnapshotStore};
 use virality_sim::simulate_with_llm;
 
@@ -103,6 +103,7 @@ async fn simulate_handler(
     } else {
         None
     };
+    let mut progress_done: Option<Arc<AtomicBool>> = None;
 
     let mut warnings = Vec::new();
     let llm_result = if use_ai {
@@ -112,7 +113,10 @@ async fn simulate_handler(
         match &state.llm_client {
             Some(client) => {
                 if let Some(sender) = channel.as_ref() {
+                    let prompt = prompt_for_text(&input.text);
+                    send_event(sender, "prompt", &prompt);
                     send_event(sender, "calling", "Calling Grok API");
+                    progress_done = Some(start_progress(sender.clone()));
                 }
                 let result = if let Some(sender) = channel.as_ref() {
                     let token_sender = sender.clone();
@@ -151,6 +155,10 @@ async fn simulate_handler(
     } else {
         None
     };
+
+    if let Some(done_flag) = progress_done {
+        done_flag.store(true, Ordering::Relaxed);
+    }
 
     if let Some(sender) = channel.as_ref() {
         send_event(sender, "merge", "Merging Grok signals into model");
@@ -277,6 +285,20 @@ fn schedule_cleanup(channels: Arc<Mutex<HashMap<String, broadcast::Sender<Stream
         let mut guard = channels.lock().await;
         guard.remove(&request_id);
     });
+}
+
+fn start_progress(sender: broadcast::Sender<StreamEvent>) -> Arc<AtomicBool> {
+    let done = Arc::new(AtomicBool::new(false));
+    let done_flag = done.clone();
+    tokio::spawn(async move {
+        let mut elapsed = 0;
+        while !done_flag.load(Ordering::Relaxed) {
+            send_event(&sender, "progress", &format!("Waiting on Grok... {}s", elapsed));
+            elapsed += 1;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    });
+    done
 }
 
 fn generate_request_id() -> String {

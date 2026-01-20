@@ -111,18 +111,44 @@ body {
 .inputs {
   max-height: 72vh;
   overflow-y: auto;
+  position: relative;
 }
 
 .panel-header {
   display: flex;
   justify-content: space-between;
-  align-items: center;
+  align-items: flex-start;
   gap: 16px;
+  position: sticky;
+  top: 0;
+  background: var(--bg);
+  padding-bottom: 12px;
+  margin-bottom: 12px;
+  border-bottom: 1px solid var(--border);
+  z-index: 2;
 }
 
 .panel-header h2 {
   margin: 0;
   font-size: 20px;
+}
+
+.panel-title {
+  display: grid;
+  gap: 6px;
+}
+
+.panel-subhead {
+  margin: 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.panel-actions {
+  display: grid;
+  gap: 8px;
+  justify-items: end;
+  text-align: right;
 }
 
 .toggle {
@@ -203,13 +229,6 @@ body {
 .slider div {
   display: flex;
   justify-content: space-between;
-}
-
-.compose-actions {
-  display: flex;
-  align-items: center;
-  gap: 16px;
-  margin-top: 18px;
 }
 
 .primary {
@@ -402,6 +421,12 @@ body {
   gap: 8px;
   font-size: 13px;
   color: var(--muted);
+}
+
+.progress-message {
+  margin: 0;
+  font-size: 12px;
+  color: var(--subtle);
 }
 
 .activity li {
@@ -673,6 +698,16 @@ body {
 
   .inputs {
     max-height: none;
+  }
+
+  .panel-header {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .panel-actions {
+    justify-items: start;
+    text-align: left;
   }
 
   .score-header {
