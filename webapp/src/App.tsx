@@ -488,7 +488,7 @@ function App() {
       </header>
 
       {alerts.length > 0 && (
-        <div className="alert">
+        <div className="alert" role="status" aria-live="polite">
           {alerts.map((item) => (
             <span key={item}>{item}</span>
           ))}
@@ -513,23 +513,41 @@ function App() {
                 />
                 <span>Use Grok analysis</span>
               </label>
-              <button className="primary" onClick={handleSimulate} disabled={loading}>
-                {loading ? <span className="spinner" /> : "Simulate"}
+              <button className="primary" onClick={handleSimulate} disabled={loading} aria-busy={loading}>
+                {loading && <span className="spinner" aria-hidden="true" />}
+                <span>Simulate</span>
               </button>
               <span className="hint">
                 {loading
                   ? "Grok is analyzing your tweet..."
                   : form.useAi
-                    ? "Requires local server + XAI_API_KEY"
-                    : "Local heuristic simulation"}
+                    ? "Requires local server + XAI_API_KEY. Ctrl/Cmd + Enter to run."
+                    : "Local heuristic simulation. Ctrl/Cmd + Enter to run."}
               </span>
             </div>
+          </div>
+
+          <div className={`mode-banner ${form.useAi ? "ai" : "local"}`}>
+            <span className="mode-pill">{form.useAi ? "Grok mode" : "Local mode"}</span>
+            <p>
+              {form.useAi
+                ? "Grok scores hook, clarity, novelty, and shareability before we merge signals."
+                : "Runs the local heuristic model with no external calls."}
+            </p>
           </div>
 
           <div className="compose">
             <textarea
               value={form.text}
               onChange={(event) => setForm({ ...form, text: event.target.value })}
+              onKeyDown={(event) => {
+                if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
+                  event.preventDefault();
+                  if (!loading) {
+                    handleSimulate();
+                  }
+                }
+              }}
               placeholder="What's happening?"
             />
             <div className="compose-meta">
@@ -538,6 +556,7 @@ function App() {
             </div>
           </div>
 
+          <div className="section-label">Account context</div>
           <div className="grid two">
             <Field label="Followers">
               <input
@@ -602,6 +621,7 @@ function App() {
             </Field>
           </div>
 
+          <div className="section-label">Post metadata</div>
           <div className="grid two">
             <Field label="Media type">
               <select
@@ -642,6 +662,7 @@ function App() {
             </Field>
           </div>
 
+          <div className="section-label">Ranking knobs</div>
           <div className="slider-grid">
             <Slider
               label="Novelty"
@@ -754,7 +775,11 @@ function App() {
                 {loading ? "Running" : "Idle"}
               </span>
             </div>
-            {progressMessage && <p className="progress-message">{progressMessage}</p>}
+            {progressMessage && (
+              <p className="progress-message" role="status" aria-live="polite">
+                {progressMessage}
+              </p>
+            )}
             <ul className="activity">
               {activity.map((step) => (
                 <li key={step.label} className={step.status}>
