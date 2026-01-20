@@ -690,6 +690,9 @@ function App() {
 
   return (
     <div className="app">
+      <a href="#main-content" className="skip-link">
+        Skip to main content
+      </a>
       <header className="topbar">
         <div>
           <p className="eyebrow">X-style ranking sandbox</p>
@@ -699,12 +702,22 @@ function App() {
           </p>
         </div>
         <div className="top-actions">
-          <button className="ghost" onClick={handleSaveSnapshot}>
+          <button
+            className="ghost"
+            onClick={handleSaveSnapshot}
+            aria-describedby="save-hint"
+          >
             Save snapshot
           </button>
-          <button className="ghost" onClick={handleShareSnapshot}>
+          <button
+            className="ghost"
+            onClick={handleShareSnapshot}
+            aria-describedby="share-hint"
+          >
             Share snapshot
           </button>
+          <span id="save-hint" className="sr-only">Save current simulation results for later comparison</span>
+          <span id="share-hint" className="sr-only">Copy a shareable link to the clipboard</span>
         </div>
       </header>
 
@@ -716,8 +729,8 @@ function App() {
         </div>
       )}
 
-      <div className="main-grid">
-        <section className="panel inputs">
+      <main id="main-content" className="main-grid">
+        <section className="panel inputs" aria-label="Tweet inputs">
           <div className="panel-header">
             <div className="panel-title">
               <h2>Tweet inputs</h2>
@@ -734,9 +747,15 @@ function App() {
                 />
                 <span>Use Grok analysis</span>
               </label>
-              <button className="primary" onClick={handleSimulate} disabled={loading} aria-busy={loading}>
+              <button
+                className="primary"
+                onClick={handleSimulate}
+                disabled={loading}
+                aria-busy={loading}
+                aria-live="polite"
+              >
                 {loading && <span className="spinner" aria-hidden="true" />}
-                <span>Simulate</span>
+                <span>{loading ? "Simulating…" : "Simulate"}</span>
               </button>
               <span className="hint">
                 {loading
@@ -805,7 +824,11 @@ function App() {
           </div>
 
           <div className="compose">
+            <label htmlFor="tweet-text" className="sr-only">
+              Tweet text
+            </label>
             <textarea
+              id="tweet-text"
               value={form.text}
               onChange={(event) => setForm({ ...form, text: event.target.value })}
               onKeyDown={(event) => {
@@ -817,39 +840,45 @@ function App() {
                 }
               }}
               placeholder="What's happening?"
+              aria-describedby="tweet-char-count tweet-char-hint"
             />
             <div className="compose-meta">
-              <span>{charCount} chars</span>
-              <span>Target 80-200 chars for strong hooks</span>
+              <span id="tweet-char-count" aria-live="polite">
+                {charCount} chars
+              </span>
+              <span id="tweet-char-hint">Target 80-200 chars for strong hooks</span>
             </div>
           </div>
 
-          <div className="section-label">Account context</div>
-          <div className="grid two">
+          <div className="section-label" id="account-context-label">Account context</div>
+          <div className="grid two" role="group" aria-labelledby="account-context-label">
             <Field label="Followers">
               <input
                 type="number"
+                min={0}
                 value={form.followers}
                 onChange={(event) =>
-                  setForm({ ...form, followers: Number(event.target.value) })
+                  setForm({ ...form, followers: Math.max(0, Number(event.target.value)) })
                 }
               />
             </Field>
             <Field label="Following">
               <input
                 type="number"
+                min={0}
                 value={form.following}
                 onChange={(event) =>
-                  setForm({ ...form, following: Number(event.target.value) })
+                  setForm({ ...form, following: Math.max(0, Number(event.target.value)) })
                 }
               />
             </Field>
             <Field label="Account age (days)">
               <input
                 type="number"
+                min={0}
                 value={form.accountAgeDays}
                 onChange={(event) =>
-                  setForm({ ...form, accountAgeDays: Number(event.target.value) })
+                  setForm({ ...form, accountAgeDays: Math.max(0, Number(event.target.value)) })
                 }
               />
             </Field>
@@ -857,11 +886,13 @@ function App() {
               <input
                 type="number"
                 step="0.01"
+                min={0}
+                max={1}
                 value={form.avgEngagementRate}
                 onChange={(event) =>
                   setForm({
                     ...form,
-                    avgEngagementRate: Number(event.target.value),
+                    avgEngagementRate: Math.max(0, Math.min(1, Number(event.target.value))),
                   })
                 }
               />
@@ -870,9 +901,10 @@ function App() {
               <input
                 type="number"
                 step="0.1"
+                min={0}
                 value={form.postsPerDay}
                 onChange={(event) =>
-                  setForm({ ...form, postsPerDay: Number(event.target.value) })
+                  setForm({ ...form, postsPerDay: Math.max(0, Number(event.target.value)) })
                 }
               />
             </Field>
@@ -883,7 +915,7 @@ function App() {
                 max={23}
                 value={form.hourOfDay}
                 onChange={(event) =>
-                  setForm({ ...form, hourOfDay: Number(event.target.value) })
+                  setForm({ ...form, hourOfDay: Math.max(0, Math.min(23, Number(event.target.value))) })
                 }
               />
             </Field>
@@ -970,49 +1002,88 @@ function App() {
 
         </section>
 
-        <section className="panel score">
+        <section
+          className={`panel score ${loading ? "loading" : ""}`}
+          aria-label="Simulation results"
+          aria-busy={loading}
+        >
           <div className="score-header">
-            <div>
-              <p className="label">Virality score</p>
-              <h2 style={{ color: scoreColor }}>{result.score.toFixed(1)}</h2>
-              <span className="pill">{result.tier}</span>
+            <div aria-live="polite" aria-atomic="true">
+              <p className="label" id="score-label">Virality score</p>
+              {loading ? (
+                <>
+                  <div className="skeleton skeleton-score" aria-hidden="true" />
+                  <div className="skeleton skeleton-pill" aria-hidden="true" />
+                </>
+              ) : (
+                <>
+                  <h2
+                    style={{ color: scoreColor }}
+                    aria-labelledby="score-label"
+                    aria-describedby="score-tier"
+                  >
+                    {result.score.toFixed(1)}
+                  </h2>
+                  <span className="pill" id="score-tier" role="status">
+                    {result.tier}
+                  </span>
+                </>
+              )}
             </div>
             <div className="score-meta">
               <span>Weighted score</span>
-              <strong>{formatFloat(result.weightedScore, 2)}</strong>
+              <strong>{loading ? "—" : formatFloat(result.weightedScore, 2)}</strong>
               <span>Total impressions</span>
-              <strong>{formatNumber(result.impressionsTotal)}</strong>
+              <strong>{loading ? "—" : formatNumber(result.impressionsTotal)}</strong>
               <span>In-network</span>
-              <strong>{formatNumber(result.impressionsIn)}</strong>
+              <strong>{loading ? "—" : formatNumber(result.impressionsIn)}</strong>
               <span>Out-of-network</span>
-              <strong>{formatNumber(result.impressionsOon)}</strong>
+              <strong>{loading ? "—" : formatNumber(result.impressionsOon)}</strong>
             </div>
           </div>
 
           <div className="engagements">
             <div>
               <span>Unique engaged users</span>
-              <strong>{formatNumber(result.expectedUniqueEngagements)}</strong>
-              <small>{formatPercent(result.uniqueEngagementRate)}</small>
+              <strong>{loading ? "—" : formatNumber(result.expectedUniqueEngagements)}</strong>
+              <small>{loading ? "—" : formatPercent(result.uniqueEngagementRate)}</small>
             </div>
             <div>
               <span>Total action volume</span>
-              <strong>{formatNumber(result.expectedActionVolume)}</strong>
-              <small>{formatFloat(result.actionVolumeRate, 2)} actions / impression</small>
+              <strong>{loading ? "—" : formatNumber(result.expectedActionVolume)}</strong>
+              <small>{loading ? "—" : `${formatFloat(result.actionVolumeRate, 2)} actions / impression`}</small>
             </div>
           </div>
 
           <div className="stats-grid">
-            <Stat label="Likes" value={result.impressionsTotal * result.actions.like} />
-            <Stat label="Replies" value={result.impressionsTotal * result.actions.reply} />
-            <Stat label="Reposts" value={result.impressionsTotal * result.actions.repost} />
-            <Stat label="Shares" value={result.impressionsTotal * result.actions.share} />
+            {loading ? (
+              <>
+                <div className="skeleton skeleton-stat" aria-hidden="true" />
+                <div className="skeleton skeleton-stat" aria-hidden="true" />
+                <div className="skeleton skeleton-stat" aria-hidden="true" />
+                <div className="skeleton skeleton-stat" aria-hidden="true" />
+              </>
+            ) : (
+              <>
+                <Stat label="Likes" value={result.impressionsTotal * result.actions.like} />
+                <Stat label="Replies" value={result.impressionsTotal * result.actions.reply} />
+                <Stat label="Reposts" value={result.impressionsTotal * result.actions.repost} />
+                <Stat label="Shares" value={result.impressionsTotal * result.actions.share} />
+              </>
+            )}
           </div>
 
           <div className="suggestions">
             <h3>Suggestions</h3>
-            {result.suggestions.length === 0 ? (
-              <p>No major blockers. Try A/B testing hooks.</p>
+            {loading ? (
+              <div className="empty-state">
+                <p>Analyzing your tweet…</p>
+              </div>
+            ) : result.suggestions.length === 0 ? (
+              <div className="empty-state">
+                <p>Looking good! No major issues detected.</p>
+                <p className="muted">Try A/B testing different hooks to optimize further.</p>
+              </div>
             ) : (
               <ul>
                 {result.suggestions.map((item) => (
@@ -1022,9 +1093,9 @@ function App() {
             )}
           </div>
         </section>
-      </div>
+      </main>
 
-      <section className="panel under-hood">
+      <section className="panel under-hood" aria-label="Debug information">
         <div className="under-hood-header">
           <div>
             <h3>Under the hood</h3>
@@ -1048,17 +1119,26 @@ function App() {
                 {progressMessage}
               </p>
             )}
-            <ul className="activity">
+            <ul className="activity" aria-label="Simulation steps">
               {activity.map((step) => (
-                <li key={step.label} className={step.status}>
-                  <span className="dot" />
-                  {step.label}
+                <li
+                  key={step.label}
+                  className={step.status}
+                  aria-current={step.status === "active" ? "step" : undefined}
+                >
+                  <span className="dot" aria-hidden="true" />
+                  <span>
+                    {step.label}
+                    <span className="sr-only">
+                      {step.status === "done" ? " (completed)" : step.status === "active" ? " (in progress)" : step.status === "error" ? " (failed)" : " (pending)"}
+                    </span>
+                  </span>
                 </li>
               ))}
             </ul>
-            <div className="logs">
+            <div className="logs" role="log" aria-live="polite" aria-label="Activity log">
               {logs.length === 0 ? (
-                <p>No live logs yet.</p>
+                <p className="muted">Run a simulation to see activity logs.</p>
               ) : (
                 <ul>
                   {logs.map((entry) => (
@@ -1140,7 +1220,9 @@ function App() {
                   </div>
                 </div>
               ) : (
-                <p className="muted">Run Grok to see parsed signals.</p>
+                <div className="empty-state">
+                  <p className="muted">Enable "Use Grok analysis" and run a simulation to see AI-parsed signals.</p>
+                </div>
               )}
             </div>
             {result.llmTrace && (
@@ -1178,12 +1260,15 @@ function App() {
             </div>
           </div>
 
-          <div className="hood-card">
+          <div className="hood-card" role="region" aria-label="Saved snapshots">
             <div className="card-header">
               <h4>Snapshots</h4>
             </div>
             {snapshots.length === 0 ? (
-              <p className="muted">No snapshots saved yet.</p>
+              <div className="empty-state">
+                <p>No snapshots saved yet.</p>
+                <p className="muted">Save simulations to compare results over time.</p>
+              </div>
             ) : (
               <ul className="snapshot-list">
                 {snapshots.map((snapshot) => (
@@ -1193,8 +1278,18 @@ function App() {
                       <span>{formatDate(snapshot.createdAt)}</span>
                     </div>
                     <div className="snapshot-actions">
-                      <button onClick={() => handleLoadSnapshot(snapshot)}>Load</button>
-                      <button onClick={() => handleDeleteSnapshot(snapshot.id)}>Delete</button>
+                      <button
+                        onClick={() => handleLoadSnapshot(snapshot)}
+                        aria-label={`Load snapshot ${snapshot.id}`}
+                      >
+                        Load
+                      </button>
+                      <button
+                        onClick={() => handleDeleteSnapshot(snapshot.id)}
+                        aria-label={`Delete snapshot ${snapshot.id}`}
+                      >
+                        Delete
+                      </button>
                     </div>
                   </li>
                 ))}
@@ -1202,12 +1297,15 @@ function App() {
             )}
           </div>
 
-          <div className="hood-card compare">
+          <div className="hood-card compare" role="region" aria-label="Compare snapshots">
             <div className="card-header">
               <h4>Snapshot compare</h4>
             </div>
             {snapshots.length < 2 || !compareLeft || !compareRight ? (
-              <p className="muted">Save at least two snapshots to compare.</p>
+              <div className="empty-state">
+                <p>Save at least two snapshots to compare.</p>
+                <p className="muted">See how changes to your tweet affect the predicted performance.</p>
+              </div>
             ) : (
               <>
                 <div className="compare-select">
@@ -1436,11 +1534,16 @@ function Slider({
   max?: number;
   onChange: (value: number) => void;
 }) {
+  const percentage = Math.round(((value - min) / (max - min)) * 100);
+  const valueText = min < 0
+    ? `${value >= 0 ? "+" : ""}${value.toFixed(2)}`
+    : `${percentage}%`;
+
   return (
     <label className="slider">
       <div>
-        <span>{label}</span>
-        <strong>{value.toFixed(2)}</strong>
+        <span id={`slider-${label.toLowerCase().replace(/\s+/g, "-")}`}>{label}</span>
+        <strong aria-hidden="true">{value.toFixed(2)}</strong>
       </div>
       <input
         type="range"
@@ -1449,6 +1552,11 @@ function Slider({
         step={0.01}
         value={value}
         onChange={(event) => onChange(Number(event.target.value))}
+        aria-labelledby={`slider-${label.toLowerCase().replace(/\s+/g, "-")}`}
+        aria-valuemin={min}
+        aria-valuemax={max}
+        aria-valuenow={value}
+        aria-valuetext={`${label}: ${valueText}`}
       />
     </label>
   );
