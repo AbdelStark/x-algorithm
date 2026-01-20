@@ -26,11 +26,13 @@ use tower_http::services::{ServeDir, ServeFile};
 use crate::api::{ApiSimulationRequest, ApiSimulationResponse};
 use crate::llm::{prompt_for_text, LlmClient};
 use crate::snapshots::{Snapshot, SnapshotStore};
+use crate::x_api::{XApiClient, XUserProfile};
 use virality_sim::simulate_with_llm;
 
 #[derive(Clone)]
 struct AppState {
     llm_client: Option<LlmClient>,
+    x_client: Option<XApiClient>,
     channels: Arc<Mutex<HashMap<String, broadcast::Sender<StreamEvent>>>>,
     snapshots: Arc<SnapshotStore>,
 }
@@ -47,6 +49,11 @@ struct StreamQuery {
     request_id: String,
 }
 
+#[derive(Deserialize)]
+struct XProfileQuery {
+    username: String,
+}
+
 static REQUEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 pub async fn serve(args: crate::ServeArgs) -> Result<(), String> {
@@ -54,6 +61,7 @@ pub async fn serve(args: crate::ServeArgs) -> Result<(), String> {
     let snapshot_store = SnapshotStore::load(snapshot_path).await?;
     let state = AppState {
         llm_client: LlmClient::from_env(None),
+        x_client: XApiClient::from_env(),
         channels: Arc::new(Mutex::new(HashMap::new())),
         snapshots: Arc::new(snapshot_store),
     };
@@ -66,6 +74,7 @@ pub async fn serve(args: crate::ServeArgs) -> Result<(), String> {
         .route("/api/health", get(health))
         .route("/api/simulate", post(simulate_handler))
         .route("/api/simulate/stream", get(stream_handler))
+        .route("/api/x/profile", get(x_profile_handler))
         .route("/api/snapshots", get(list_snapshots).post(create_snapshot))
         .route("/api/snapshots/:id", get(get_snapshot).delete(delete_snapshot))
         .nest_service("/", static_service)
@@ -256,6 +265,28 @@ async fn stream_handler(
 
     send_event(&sender, "connected", "Streaming Grok status");
     Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(8))))
+}
+
+async fn x_profile_handler(
+    State(state): State<AppState>,
+    Query(query): Query<XProfileQuery>,
+) -> Result<Json<XUserProfile>, (StatusCode, String)> {
+    let username = query.username.trim();
+    if username.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "username is required".to_string()));
+    }
+
+    let client = state
+        .x_client
+        .as_ref()
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "X API not configured".to_string()))?;
+
+    let profile = client
+        .fetch_user_by_username(username)
+        .await
+        .map_err(|err| (StatusCode::BAD_GATEWAY, err))?;
+
+    Ok(Json(profile))
 }
 
 async fn get_or_create_channel(

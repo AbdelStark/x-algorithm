@@ -99,6 +99,17 @@ type Snapshot = {
   output: SimulationResult;
 };
 
+type XProfile = {
+  id: string;
+  username: string;
+  name: string;
+  createdAt?: string | null;
+  verified?: boolean | null;
+  protected?: boolean | null;
+  followers: number;
+  following: number;
+};
+
 type CompareRow = {
   label: string;
   left: number;
@@ -167,7 +178,12 @@ function App() {
   const [activeSnapshotId, setActiveSnapshotId] = useState<string | null>(null);
   const [compareLeftId, setCompareLeftId] = useState<string | null>(null);
   const [compareRightId, setCompareRightId] = useState<string | null>(null);
+  const [xHandle, setXHandle] = useState("");
+  const [xProfile, setXProfile] = useState<XProfile | null>(null);
+  const [xStatus, setXStatus] = useState<"idle" | "loading" | "connected" | "error">("idle");
+  const [xStatusMessage, setXStatusMessage] = useState<string | null>(null);
   const eventSourceRef = useRef<EventSource | null>(null);
+  const autoFetchRef = useRef(false);
 
   const charCount = form.text.length;
   const transcriptText = loading ? liveTranscript : result.llmTrace?.raw_response || liveTranscript;
@@ -182,6 +198,9 @@ function App() {
     () => snapshots.find((item) => item.id === compareRightId) ?? null,
     [snapshots, compareRightId]
   );
+  const xStatusText =
+    xStatusMessage ??
+    (xProfile ? `Connected as @${xProfile.username}` : "Not connected");
 
   const scoreColor = useMemo(() => {
     if (result.score >= 80) return "var(--accent)";
@@ -213,6 +232,31 @@ function App() {
       cancelled = true;
     };
   }, []);
+
+  useEffect(() => {
+    const saved = localStorage.getItem("xHandle");
+    if (saved) {
+      setXHandle(saved);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (xHandle) {
+      localStorage.setItem("xHandle", xHandle);
+    } else {
+      localStorage.removeItem("xHandle");
+    }
+  }, [xHandle]);
+
+  useEffect(() => {
+    if (!xHandle || xProfile || xStatus === "loading") return;
+    if (autoFetchRef.current) return;
+    autoFetchRef.current = true;
+    const handle = normalizeHandle(xHandle);
+    if (handle) {
+      fetchXProfile(handle);
+    }
+  }, [xHandle, xProfile, xStatus]);
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
@@ -401,6 +445,16 @@ function App() {
     }
   };
 
+  const handleConnectX = async () => {
+    const handle = normalizeHandle(xHandle);
+    if (!handle) {
+      setXStatus("error");
+      setXStatusMessage("Enter a username to connect.");
+      return;
+    }
+    await fetchXProfile(handle);
+  };
+
   const clearLogs = () => setLogs([]);
 
   async function createSnapshot(): Promise<Snapshot | null> {
@@ -467,6 +521,45 @@ function App() {
     }
   }
 
+  async function fetchXProfile(handle: string) {
+    setXStatus("loading");
+    setXStatusMessage("Connecting to X...");
+    try {
+      const response = await fetch(`/api/x/profile?username=${encodeURIComponent(handle)}`);
+      if (!response.ok) {
+        const detail = await response.text();
+        setXStatus("error");
+        setXStatusMessage(extractErrorMessage(detail, response.status));
+        return;
+      }
+      const data = await response.json();
+      const profile = normalizeXProfile(data);
+      if (!profile) {
+        setXStatus("error");
+        setXStatusMessage("Invalid profile response.");
+        return;
+      }
+      setXProfile(profile);
+      setXStatus("connected");
+      setXStatusMessage(`Connected as @${profile.username} (${profile.name})`);
+      applyProfileToForm(profile);
+    } catch {
+      setXStatus("error");
+      setXStatusMessage("Unable to reach X API.");
+    }
+  }
+
+  function applyProfileToForm(profile: XProfile) {
+    const ageDays = daysSince(profile.createdAt);
+    setForm((prev) => ({
+      ...prev,
+      followers: profile.followers,
+      following: profile.following,
+      accountAgeDays: ageDays ?? prev.accountAgeDays,
+      verified: profile.verified ?? prev.verified,
+    }));
+  }
+
   return (
     <div className="app">
       <header className="topbar">
@@ -524,6 +617,48 @@ function App() {
                     ? "Requires local server + XAI_API_KEY. Ctrl/Cmd + Enter to run."
                     : "Local heuristic simulation. Ctrl/Cmd + Enter to run."}
               </span>
+            </div>
+          </div>
+
+          <div className="x-connect">
+            <label className="field">
+              <span>X handle</span>
+              <div className="x-input">
+                <span>@</span>
+                <input
+                  type="text"
+                  value={xHandle}
+                  onChange={(event) => {
+                    const value = event.target.value;
+                    setXHandle(value);
+                    if (
+                      xProfile &&
+                      normalizeHandle(value).toLowerCase() !== xProfile.username.toLowerCase()
+                    ) {
+                      setXProfile(null);
+                      setXStatus("idle");
+                      setXStatusMessage(null);
+                    }
+                  }}
+                  placeholder="username"
+                  autoComplete="username"
+                />
+              </div>
+            </label>
+            <button
+              className="ghost"
+              onClick={handleConnectX}
+              disabled={xStatus === "loading"}
+            >
+              {xStatus === "connected" ? "Refresh X" : "Connect X"}
+            </button>
+            <div className={`x-status ${xStatus}`} role="status" aria-live="polite">
+              <span>{xStatusText}</span>
+              {xProfile && (
+                <span className="x-summary">
+                  Followers {formatNumber(xProfile.followers)} • Following {formatNumber(xProfile.following)}
+                </span>
+              )}
             </div>
           </div>
 
@@ -1333,6 +1468,45 @@ function normalizeSnapshotOutput(raw: any): SimulationResult {
     return raw as SimulationResult;
   }
   return normalizeApiResponse(raw);
+}
+
+function normalizeHandle(value: string) {
+  return value.trim().replace(/^@/, "");
+}
+
+function normalizeXProfile(raw: any): XProfile | null {
+  if (!raw || typeof raw !== "object") return null;
+  return {
+    id: String(raw.id ?? ""),
+    username: String(raw.username ?? ""),
+    name: String(raw.name ?? ""),
+    createdAt: raw.created_at ?? raw.createdAt ?? null,
+    verified: raw.verified ?? null,
+    protected: raw.protected ?? null,
+    followers: Number(raw.followers ?? 0),
+    following: Number(raw.following ?? 0),
+  };
+}
+
+function extractErrorMessage(body: string, status: number) {
+  if (!body) {
+    return `X API error (${status}).`;
+  }
+  try {
+    const parsed = JSON.parse(body) as { error?: string; message?: string; detail?: string };
+    return parsed.error || parsed.message || parsed.detail || `X API error (${status}).`;
+  } catch {
+    return body.length > 140 ? `${body.slice(0, 140)}…` : body;
+  }
+}
+
+function daysSince(value?: string | null) {
+  if (!value) return null;
+  const timestamp = Date.parse(value);
+  if (!Number.isFinite(timestamp)) return null;
+  const diff = Date.now() - timestamp;
+  if (diff <= 0) return 0;
+  return Math.floor(diff / (1000 * 60 * 60 * 24));
 }
 
 function buildCompareRows(left: Snapshot, right: Snapshot): CompareRow[] {

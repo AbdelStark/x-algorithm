@@ -2,6 +2,7 @@ mod api;
 mod llm;
 mod server;
 mod snapshots;
+mod x_api;
 
 use clap::{Args, Parser, Subcommand};
 use std::io::{self, Read};
