@@ -10,8 +10,9 @@ No CI or deployment automation is configured here.
 </environment>
 
 <stack>
-- Rust (tokio, tonic gRPC, async_trait, log); code references internal xai_* crates.
+- Rust (tokio, axum, reqwest, clap) for the simulator CLI + API proxy.
 - Python 3.11 (JAX, Haiku, NumPy) managed by uv in `phoenix/`.
+- Web: React + Vite + TypeScript in `webapp/`.
 - Tests: pytest (Python).
 </stack>
 
@@ -23,6 +24,8 @@ No CI or deployment automation is configured here.
 - `thunder/`: Rust in-memory post store + Kafka ingestion + gRPC service.
 - `phoenix/`: Python JAX retrieval/ranking models; entrypoints `run_ranker.py`,
   `run_retrieval.py`; tests `test_*.py`.
+- `simulator/`: Rust CLI + local API proxy for Grok scoring.
+- `webapp/`: React/Vite UI for the simulator.
 - `README.md`: architecture overview.
 </structure>
 
@@ -49,6 +52,9 @@ No CI or deployment automation is configured here.
 | Run ranker | `uv run run_ranker.py` | Run in `phoenix/` |
 | Run retrieval | `uv run run_retrieval.py` | Run in `phoenix/` |
 | Tests | `uv run pytest test_recsys_model.py test_recsys_retrieval_model.py` | Run in `phoenix/` |
+| Web dev | `npm run dev` | Run in `webapp/` |
+| Web build | `npm run build` | Run in `webapp/` |
+| Simulator API | `cargo run -- serve --web-root ../webapp/dist` | Run in `simulator/` |
 </commands>
 
 <workflows>

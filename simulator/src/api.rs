@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
-use virality_sim::{ActionProbs, LlmScore, MediaType, Signals, SimulationOutput, SimulatorInput};
+use virality_sim::{
+    ActionProbs, LlmScore, LlmTrace, MediaType, Signals, SimulationOutput, SimulatorInput,
+};
 
 #[derive(Debug, Deserialize)]
 pub struct ApiSimulationRequest {
@@ -104,6 +106,7 @@ pub struct ApiSimulationResponse {
     pub signals: Signals,
     pub suggestions: Vec<String>,
     pub llm: Option<LlmScore>,
+    pub llm_trace: Option<LlmTrace>,
     pub warnings: Vec<String>,
 }
 
@@ -124,6 +127,7 @@ impl ApiSimulationResponse {
             signals: output.signals,
             suggestions: output.suggestions,
             llm: output.llm,
+            llm_trace: output.llm_trace,
             warnings,
         }
     }

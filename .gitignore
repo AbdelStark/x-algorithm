@@ -1,4 +1,8 @@
 __pycache__/
 .env
+node_modules/
+webapp/node_modules/
+webapp/dist/
+webapp/.vite/
 **/target/
 **/.env

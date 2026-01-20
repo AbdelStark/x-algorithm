@@ -1,17 +1,31 @@
-# Virality Simulator (Web)
+# Virality Simulator Web
 
-Static webapp version of the virality simulator. Open `webapp/index.html` in a browser and adjust inputs to see predicted score, impressions, and suggestions.
+React + Vite frontend that mirrors the simulator model and can call the local Rust proxy for Grok scoring.
 
-The model is heuristic and mirrors the Rust CLI formulas for consistency.
+## Install
 
-## Grok-assisted mode
+```sh
+cd webapp
+npm install
+```
 
-Run the local proxy server so the webapp can call the xAI API without exposing your key (set `XAI_API_KEY` or put it in `simulator/.env`):
+## Dev
+
+```sh
+npm run dev
+```
+
+The dev server proxies `/api` to `http://127.0.0.1:8787`.
+
+## Build
+
+```sh
+npm run build
+```
+
+Serve the built assets with:
 
 ```sh
 cd simulator
-export XAI_API_KEY="..."
-cargo run -- serve --port 8787
+cargo run -- serve --web-root ../webapp/dist
 ```
-
-Then open `http://localhost:8787` and enable the Grok toggle.

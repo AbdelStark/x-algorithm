@@ -30,7 +30,12 @@ Use `XAI_API_BASE` if you need a custom endpoint.
 ## Serve the webapp
 
 ```sh
-cargo run -- serve --port 8787
+cd webapp
+npm install
+npm run build
+
+cd ../simulator
+cargo run -- serve --port 8787 --web-root ../webapp/dist
 ```
 
 Then open `http://localhost:8787` in a browser.

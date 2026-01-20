@@ -1,7 +1,14 @@
 use reqwest::header::AUTHORIZATION;
 use serde::{Deserialize, Serialize};
 use std::env;
-use virality_sim::LlmScore;
+use std::time::Instant;
+use virality_sim::{LlmScore, LlmTrace};
+
+#[derive(Clone)]
+pub struct LlmResult {
+    pub score: LlmScore,
+    pub trace: LlmTrace,
+}
 
 #[derive(Clone)]
 pub struct LlmClient {
@@ -27,7 +34,7 @@ impl LlmClient {
         })
     }
 
-    pub async fn score_text(&self, text: &str) -> Result<LlmScore, String> {
+    pub async fn score_text(&self, text: &str) -> Result<LlmResult, String> {
         let url = format!("{}/chat/completions", self.api_base.trim_end_matches('/'));
         let request = ChatRequest {
             model: self.model.clone(),
@@ -44,6 +51,7 @@ impl LlmClient {
             ],
         };
 
+        let started = Instant::now();
         let response = self
             .client
             .post(url)
@@ -98,7 +106,18 @@ impl LlmClient {
             .take(6)
             .collect();
 
-        Ok(score)
+        let usage = body.usage.unwrap_or_default();
+        let trace = LlmTrace {
+            model: body.model.unwrap_or_else(|| self.model.clone()),
+            latency_ms: started.elapsed().as_millis(),
+            prompt_summary: prompt_summary(),
+            raw_response: content,
+            prompt_tokens: usage.prompt_tokens,
+            completion_tokens: usage.completion_tokens,
+            total_tokens: usage.total_tokens,
+        };
+
+        Ok(LlmResult { score, trace })
     }
 }
 
@@ -118,6 +137,8 @@ struct ChatMessage {
 #[derive(Deserialize)]
 struct ChatResponse {
     choices: Vec<ChatChoice>,
+    model: Option<String>,
+    usage: Option<ChatUsage>,
 }
 
 #[derive(Deserialize)]
@@ -128,6 +149,13 @@ struct ChatChoice {
 #[derive(Deserialize)]
 struct ChatMessageResponse {
     content: String,
+}
+
+#[derive(Deserialize, Default)]
+struct ChatUsage {
+    prompt_tokens: Option<u32>,
+    completion_tokens: Option<u32>,
+    total_tokens: Option<u32>,
 }
 
 fn system_prompt() -> String {
@@ -145,6 +173,10 @@ Rules:
 - Use decimals with a leading 0 (e.g., 0.42).
 "#;
     prompt.to_string()
+}
+
+fn prompt_summary() -> String {
+    "Scores hook, clarity, novelty, shareability, controversy, sentiment + suggestions.".to_string()
 }
 
 fn extract_json(text: &str) -> Option<String> {

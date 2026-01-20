@@ -119,6 +119,17 @@ pub struct LlmScore {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LlmTrace {
+    pub model: String,
+    pub latency_ms: u128,
+    pub prompt_summary: String,
+    pub raw_response: String,
+    pub prompt_tokens: Option<u32>,
+    pub completion_tokens: Option<u32>,
+    pub total_tokens: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Signals {
     pub length_score: f64,
     pub clarity: f64,
@@ -190,6 +201,7 @@ pub struct SimulationOutput {
     pub signals: Signals,
     pub suggestions: Vec<String>,
     pub llm: Option<LlmScore>,
+    pub llm_trace: Option<LlmTrace>,
 }
 
 pub fn extract_text_features(text: &str) -> TextFeatures {
@@ -289,10 +301,14 @@ pub fn extract_text_features(text: &str) -> TextFeatures {
 }
 
 pub fn simulate(input: &SimulatorInput) -> SimulationOutput {
-    simulate_with_llm(input, None)
+    simulate_with_llm(input, None, None)
 }
 
-pub fn simulate_with_llm(input: &SimulatorInput, llm: Option<&LlmScore>) -> SimulationOutput {
+pub fn simulate_with_llm(
+    input: &SimulatorInput,
+    llm: Option<&LlmScore>,
+    llm_trace: Option<&LlmTrace>,
+) -> SimulationOutput {
     let features = extract_text_features(&input.text);
     let media_score = input.media.media_score();
     let has_link = input
@@ -490,6 +506,7 @@ pub fn simulate_with_llm(input: &SimulatorInput, llm: Option<&LlmScore>) -> Simu
         signals,
         suggestions,
         llm: llm.cloned(),
+        llm_trace: llm_trace.cloned(),
     }
 }
 

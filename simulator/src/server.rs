@@ -51,10 +51,10 @@ async fn simulate_handler(
     let input = request.into_input().map_err(|err| (StatusCode::BAD_REQUEST, err))?;
 
     let mut warnings = Vec::new();
-    let llm_score = if use_ai {
+    let llm_result = if use_ai {
         match &state.llm_client {
             Some(client) => match client.score_text(&input.text).await {
-                Ok(score) => Some(score),
+                Ok(result) => Some(result),
                 Err(err) => {
                     warnings.push(format!("AI scoring failed: {}", err));
                     None
@@ -69,7 +69,11 @@ async fn simulate_handler(
         None
     };
 
-    let output = simulate_with_llm(&input, llm_score.as_ref());
+    let output = simulate_with_llm(
+        &input,
+        llm_result.as_ref().map(|result| &result.score),
+        llm_result.as_ref().map(|result| &result.trace),
+    );
     let response = ApiSimulationResponse::from_output(output, warnings);
     Ok(Json(response))
 }

@@ -99,7 +99,7 @@ pub struct ServeArgs {
     host: String,
     #[arg(long, default_value_t = 8787)]
     port: u16,
-    #[arg(long, default_value = "../webapp")]
+    #[arg(long, default_value = "../webapp/dist")]
     web_root: String,
 }
 
@@ -151,7 +151,7 @@ async fn run_simulate(args: SimulateArgs) -> Result<(), String> {
     let text = read_text(args.text)?;
     input.text = text;
 
-    let llm_score = if args.ai {
+    let llm_result = if args.ai {
         let client = llm::LlmClient::from_env(args.ai_model)
             .ok_or_else(|| "XAI_API_KEY is not set".to_string())?;
         Some(client.score_text(&input.text).await?)
@@ -159,7 +159,11 @@ async fn run_simulate(args: SimulateArgs) -> Result<(), String> {
         None
     };
 
-    let output = simulate_with_llm(&input, llm_score.as_ref());
+    let output = simulate_with_llm(
+        &input,
+        llm_result.as_ref().map(|result| &result.score),
+        llm_result.as_ref().map(|result| &result.trace),
+    );
 
     println!(
         "Virality score: {} ({})",
