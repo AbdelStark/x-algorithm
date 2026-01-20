@@ -6,3 +6,5 @@ webapp/dist/
 webapp/.vite/
 **/target/
 **/.env
+.tldr/
+.tldrignore

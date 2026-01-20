@@ -110,6 +110,11 @@ type XProfile = {
   following: number;
 };
 
+type XOAuthStatus = {
+  enabled: boolean;
+  connected: boolean;
+};
+
 type CompareRow = {
   label: string;
   left: number;
@@ -182,8 +187,10 @@ function App() {
   const [xProfile, setXProfile] = useState<XProfile | null>(null);
   const [xStatus, setXStatus] = useState<"idle" | "loading" | "connected" | "error">("idle");
   const [xStatusMessage, setXStatusMessage] = useState<string | null>(null);
+  const [xOauth, setXOauth] = useState<XOAuthStatus | null>(null);
   const eventSourceRef = useRef<EventSource | null>(null);
   const autoFetchRef = useRef(false);
+  const oauthReturnHandled = useRef(false);
 
   const charCount = form.text.length;
   const transcriptText = loading ? liveTranscript : result.llmTrace?.raw_response || liveTranscript;
@@ -200,7 +207,14 @@ function App() {
   );
   const xStatusText =
     xStatusMessage ??
-    (xProfile ? `Connected as @${xProfile.username}` : "Not connected");
+    (xProfile
+      ? `Connected as @${xProfile.username}`
+      : xOauth?.enabled
+        ? "Connect X to sync your account stats."
+        : "Not connected");
+  const xButtonLabel = xOauth?.enabled
+    ? xOauth.connected ? "Refresh X" : "Connect X"
+    : xProfile ? "Refresh X" : "Connect X";
 
   const scoreColor = useMemo(() => {
     if (result.score >= 80) return "var(--accent)";
@@ -241,6 +255,21 @@ function App() {
   }, []);
 
   useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      const status = await fetchXOauthStatus();
+      if (cancelled || !status?.enabled) return;
+      if (status.connected && !xProfile) {
+        await fetchXMe();
+      }
+    };
+    void load();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
     if (xHandle) {
       localStorage.setItem("xHandle", xHandle);
     } else {
@@ -251,12 +280,13 @@ function App() {
   useEffect(() => {
     if (!xHandle || xProfile || xStatus === "loading") return;
     if (autoFetchRef.current) return;
+    if (xOauth?.enabled) return;
     autoFetchRef.current = true;
     const handle = normalizeHandle(xHandle);
     if (handle) {
       fetchXProfile(handle);
     }
-  }, [xHandle, xProfile, xStatus]);
+  }, [xHandle, xProfile, xStatus, xOauth]);
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
@@ -273,6 +303,25 @@ function App() {
     setResult(decoded.output);
     setActiveSnapshotId(decoded.id ?? null);
     setAlerts(["Loaded shared snapshot."]);
+  }, []);
+
+  useEffect(() => {
+    if (oauthReturnHandled.current) return;
+    const params = new URLSearchParams(window.location.search);
+    const oauthStatus = params.get("x_oauth");
+    const message = params.get("message");
+    if (!oauthStatus) return;
+    oauthReturnHandled.current = true;
+    if (oauthStatus === "success") {
+      void fetchXMe();
+    } else {
+      setXStatus("error");
+      setXStatusMessage(message ? decodeURIComponent(message) : "X OAuth failed.");
+    }
+    params.delete("x_oauth");
+    params.delete("message");
+    const nextUrl = `${window.location.pathname}${params.toString() ? `?${params.toString()}` : ""}`;
+    window.history.replaceState({}, "", nextUrl);
   }, []);
 
   useEffect(() => {
@@ -446,6 +495,37 @@ function App() {
   };
 
   const handleConnectX = async () => {
+    setXStatusMessage(null);
+    const status = xOauth ?? (await fetchXOauthStatus());
+    if (status?.enabled) {
+      if (status.connected) {
+        await fetchXMe();
+        return;
+      }
+      setXStatus("loading");
+      setXStatusMessage("Redirecting to X...");
+      try {
+        const response = await fetch("/api/x/oauth/start");
+        if (!response.ok) {
+          const detail = await response.text();
+          setXStatus("error");
+          setXStatusMessage(extractErrorMessage(detail, response.status));
+          return;
+        }
+        const data = await response.json();
+        if (!data?.auth_url) {
+          setXStatus("error");
+          setXStatusMessage("Missing OAuth URL from server.");
+          return;
+        }
+        window.location.assign(data.auth_url);
+      } catch {
+        setXStatus("error");
+        setXStatusMessage("Unable to reach OAuth server.");
+      }
+      return;
+    }
+
     const handle = normalizeHandle(xHandle);
     if (!handle) {
       setXStatus("error");
@@ -546,6 +626,54 @@ function App() {
     } catch {
       setXStatus("error");
       setXStatusMessage("Unable to reach X API.");
+    }
+  }
+
+  async function fetchXMe() {
+    setXStatus("loading");
+    setXStatusMessage("Fetching X profile...");
+    try {
+      const response = await fetch("/api/x/me");
+      if (!response.ok) {
+        const detail = await response.text();
+        setXStatus("error");
+        setXStatusMessage(extractErrorMessage(detail, response.status));
+        return;
+      }
+      const data = await response.json();
+      const profile = normalizeXProfile(data);
+      if (!profile) {
+        setXStatus("error");
+        setXStatusMessage("Invalid profile response.");
+        return;
+      }
+      setXProfile(profile);
+      setXHandle(profile.username);
+      setXOauth((prev) => prev ? { ...prev, connected: true } : { enabled: true, connected: true });
+      setXStatus("connected");
+      setXStatusMessage(`Connected as @${profile.username} (${profile.name})`);
+      applyProfileToForm(profile);
+    } catch {
+      setXStatus("error");
+      setXStatusMessage("Unable to reach X API.");
+    }
+  }
+
+  async function fetchXOauthStatus(): Promise<XOAuthStatus | null> {
+    try {
+      const response = await fetch("/api/x/oauth/status");
+      if (!response.ok) {
+        return null;
+      }
+      const data = await response.json();
+      const status = {
+        enabled: Boolean(data?.enabled),
+        connected: Boolean(data?.connected),
+      };
+      setXOauth(status);
+      return status;
+    } catch {
+      return null;
     }
   }
 
@@ -650,13 +778,18 @@ function App() {
               onClick={handleConnectX}
               disabled={xStatus === "loading"}
             >
-              {xStatus === "connected" ? "Refresh X" : "Connect X"}
+              {xButtonLabel}
             </button>
             <div className={`x-status ${xStatus}`} role="status" aria-live="polite">
               <span>{xStatusText}</span>
               {xProfile && (
                 <span className="x-summary">
                   Followers {formatNumber(xProfile.followers)} • Following {formatNumber(xProfile.following)}
+                </span>
+              )}
+              {!xProfile && xOauth && (
+                <span className="x-summary">
+                  {xOauth.enabled ? "OAuth ready." : "App-only lookup."}
                 </span>
               )}
             </div>
@@ -1495,13 +1628,25 @@ function extractErrorMessage(body: string, status: number) {
   try {
     const parsed = JSON.parse(body) as { error?: string; message?: string; detail?: string };
     const detail = parsed.error || parsed.message || parsed.detail;
+    if (status === 401 && detail) {
+      return `${detail} Check X OAuth credentials or bearer token.`;
+    }
     if (status === 402 && detail) {
       return `${detail} Add credits in the X developer portal.`;
     }
+    if (status === 403 && detail) {
+      return `${detail} This endpoint may require user OAuth.`;
+    }
     return detail || `X API error (${status}).`;
   } catch {
+    if (status === 401) {
+      return "X API unauthorized. Check OAuth credentials or bearer token.";
+    }
     if (status === 402) {
       return "X API credits depleted. Add credits in the X developer portal.";
+    }
+    if (status === 403) {
+      return "X API forbidden. This endpoint may require user OAuth.";
     }
     return body.length > 140 ? `${body.slice(0, 140)}…` : body;
   }

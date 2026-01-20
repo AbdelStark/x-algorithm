@@ -15,3 +15,6 @@ tokio = { version = "1.38", features = ["rt-multi-thread", "macros"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tower-http = { version = "0.5", features = ["fs"] }
 urlencoding = "2.1"
+base64 = "0.22"
+rand = "0.8"
+sha2 = "0.10"
