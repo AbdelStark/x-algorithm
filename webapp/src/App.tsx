@@ -1,5 +1,8 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
+
+const SNAPSHOT_KEY = "viralitySnapshots";
+const LOG_LIMIT = 80;
 
 type MediaType = "none" | "image" | "video" | "gif";
 
@@ -36,6 +39,16 @@ type Signals = {
   timeliness: number;
 };
 
+type LlmScore = {
+  hook: number;
+  clarity: number;
+  novelty: number;
+  shareability: number;
+  controversy: number;
+  sentiment: number;
+  suggestions: string[];
+};
+
 type LlmTrace = {
   model: string;
   latency_ms: number;
@@ -61,12 +74,28 @@ type SimulationResult = {
   signals: Signals;
   suggestions: string[];
   warnings: string[];
+  llm?: LlmScore;
   llmTrace?: LlmTrace;
+  requestId?: string;
 };
 
 type ActivityStep = {
   label: string;
   status: "pending" | "active" | "done" | "error";
+};
+
+type LogEntry = {
+  id: string;
+  timestamp: string;
+  message: string;
+  event: string;
+};
+
+type Snapshot = {
+  id: string;
+  createdAt: string;
+  input: FormState;
+  output: SimulationResult;
 };
 
 type FormState = {
@@ -121,6 +150,9 @@ function App() {
   const [loading, setLoading] = useState(false);
   const [activity, setActivity] = useState<ActivityStep[]>(INITIAL_ACTIVITY);
   const [alerts, setAlerts] = useState<string[]>([]);
+  const [logs, setLogs] = useState<LogEntry[]>([]);
+  const [snapshots, setSnapshots] = useState<Snapshot[]>([]);
+  const eventSourceRef = useRef<EventSource | null>(null);
 
   const charCount = form.text.length;
 
@@ -131,6 +163,33 @@ function App() {
     return "#8b98a5";
   }, [result.score]);
 
+  useEffect(() => {
+    const stored = localStorage.getItem(SNAPSHOT_KEY);
+    if (stored) {
+      try {
+        const parsed = JSON.parse(stored) as Snapshot[];
+        setSnapshots(parsed);
+      } catch {
+        setSnapshots([]);
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    localStorage.setItem(SNAPSHOT_KEY, JSON.stringify(snapshots.slice(0, 20)));
+  }, [snapshots]);
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const snapshotParam = params.get("snapshot");
+    if (!snapshotParam) return;
+    const decoded = decodeSnapshot(snapshotParam);
+    if (!decoded) return;
+    setForm(decoded.input);
+    setResult(decoded.output);
+    setAlerts(["Loaded shared snapshot."]);
+  }, []);
+
   const handleSimulate = async () => {
     setAlerts([]);
     if (!form.text.trim()) {
@@ -139,30 +198,29 @@ function App() {
     }
 
     if (!form.useAi) {
-      setResult(simulateLocal(form));
+      const local = simulateLocal(form);
+      setResult(local);
       setActivity(INITIAL_ACTIVITY);
+      appendLog("local", "Local simulation complete");
       return;
     }
 
+    const requestId = generateRequestId();
     setLoading(true);
     setActivity([
       { label: "Preparing prompt", status: "active" },
       { label: "Calling Grok API", status: "pending" },
       { label: "Merging signals", status: "pending" },
     ]);
+    appendLog("start", `Simulation ${requestId} started`);
+    startStreaming(requestId);
 
     try {
-      await tick(240);
-      setActivity([
-        { label: "Preparing prompt", status: "done" },
-        { label: "Calling Grok API", status: "active" },
-        { label: "Merging signals", status: "pending" },
-      ]);
-
       const response = await fetch("/api/simulate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
+          request_id: requestId,
           text: form.text,
           media: form.media,
           has_link: form.hasLink,
@@ -191,6 +249,8 @@ function App() {
           { label: "Calling Grok API", status: "error" },
           { label: "Merging signals", status: "pending" },
         ]);
+        setLoading(false);
+        closeStream();
         return;
       }
 
@@ -198,12 +258,8 @@ function App() {
       const normalized = normalizeApiResponse(data);
       setResult(normalized);
       setAlerts(normalized.warnings);
-      setActivity([
-        { label: "Preparing prompt", status: "done" },
-        { label: "Calling Grok API", status: "done" },
-        { label: "Merging signals", status: "done" },
-      ]);
-    } catch (error) {
+      appendLog("response", "Simulation results merged");
+    } catch {
       setAlerts([
         "AI server not reachable. Run `cargo run -- serve` and open http://localhost:8787.",
       ]);
@@ -213,70 +269,109 @@ function App() {
         { label: "Calling Grok API", status: "error" },
         { label: "Merging signals", status: "pending" },
       ]);
-    } finally {
       setLoading(false);
+      closeStream();
     }
   };
 
+  const handleSaveSnapshot = () => {
+    const snapshot: Snapshot = {
+      id: generateSnapshotId(),
+      createdAt: new Date().toISOString(),
+      input: form,
+      output: result,
+    };
+    setSnapshots((prev) => [snapshot, ...prev].slice(0, 20));
+    appendLog("snapshot", `Snapshot saved (${snapshot.id})`);
+  };
+
+  const handleShareSnapshot = async () => {
+    const snapshot: Snapshot = {
+      id: generateSnapshotId(),
+      createdAt: new Date().toISOString(),
+      input: form,
+      output: result,
+    };
+    const encoded = encodeSnapshot(snapshot);
+    if (!encoded) {
+      setAlerts(["Unable to generate share link."]);
+      return;
+    }
+    const url = `${window.location.origin}${window.location.pathname}?snapshot=${encoded}`;
+    try {
+      await navigator.clipboard.writeText(url);
+      setAlerts(["Share link copied to clipboard."]);
+      appendLog("share", "Copied share link to clipboard");
+    } catch {
+      setAlerts(["Copy failed. You can manually copy the URL."]);
+    }
+  };
+
+  const handleLoadSnapshot = (snapshot: Snapshot) => {
+    setForm(snapshot.input);
+    setResult(snapshot.output);
+    setAlerts(["Snapshot loaded."]);
+  };
+
+  const handleDeleteSnapshot = (snapshotId: string) => {
+    setSnapshots((prev) => prev.filter((item) => item.id !== snapshotId));
+  };
+
+  const clearLogs = () => setLogs([]);
+
   return (
     <div className="app">
-      <aside className="nav">
-        <div className="logo">X</div>
-        <nav>
-          {[
-            { label: "Home", icon: HomeIcon },
-            { label: "Explore", icon: SearchIcon },
-            { label: "Notifications", icon: BellIcon },
-            { label: "Messages", icon: MailIcon },
-            { label: "Bookmarks", icon: BookmarkIcon },
-          ].map((item) => (
-            <button key={item.label} className="nav-item">
-              <item.icon />
-              <span>{item.label}</span>
-            </button>
-          ))}
-        </nav>
-        <button className="primary">Post</button>
-      </aside>
-
-      <main className="feed">
-        <header className="feed-header">
+      <header className="topbar">
+        <div>
+          <p className="eyebrow">X-style ranking sandbox</p>
           <h1>Virality Simulator</h1>
-          <p>Simulate how the For You ranking engine might react to a tweet.</p>
-        </header>
+          <p className="subhead">
+            Simulate how the For You ranking engine could react to a tweet draft.
+          </p>
+        </div>
+        <div className="top-actions">
+          <button className="ghost" onClick={handleSaveSnapshot}>
+            Save snapshot
+          </button>
+          <button className="ghost" onClick={handleShareSnapshot}>
+            Share snapshot
+          </button>
+        </div>
+      </header>
 
-        {alerts.length > 0 && (
-          <div className="alert">
-            {alerts.map((item) => (
-              <span key={item}>{item}</span>
-            ))}
-          </div>
-        )}
+      {alerts.length > 0 && (
+        <div className="alert">
+          {alerts.map((item) => (
+            <span key={item}>{item}</span>
+          ))}
+        </div>
+      )}
 
-        <section className="card compose">
-          <div className="compose-header">
-            <div className="avatar">A</div>
-            <div>
-              <p className="label">Tweet draft</p>
-              <textarea
-                value={form.text}
-                onChange={(event) => setForm({ ...form, text: event.target.value })}
-                placeholder="What's happening?"
-              />
-            </div>
-          </div>
-          <div className="compose-meta">
-            <span>{charCount} chars</span>
-            <div className="toggle">
+      <div className="main-grid">
+        <section className="panel inputs">
+          <div className="panel-header">
+            <h2>Tweet inputs</h2>
+            <label className="toggle">
               <input
-                id="useAi"
                 type="checkbox"
                 checked={form.useAi}
                 onChange={(event) =>
                   setForm({ ...form, useAi: event.target.checked })
                 }
               />
-              <label htmlFor="useAi">Use Grok analysis</label>
+              <span>Use Grok analysis</span>
+            </label>
+          </div>
+
+          <div className="compose">
+            <textarea
+              value={form.text}
+              onChange={(event) => setForm({ ...form, text: event.target.value })}
+              placeholder="What's happening?"
+            />
+            <div className="compose-meta">
+              <span>{charCount} chars</span>
+              <span>AI mode requires local server</span>
             </div>
           </div>
 
@@ -422,51 +517,33 @@ function App() {
           </div>
 
           <div className="compose-actions">
-            <button
-              className="primary"
-              onClick={handleSimulate}
-              disabled={loading}
-            >
-              {loading ? (
-                <span className="spinner" />
-              ) : (
-                <span>{form.useAi ? "Simulate with Grok" : "Simulate"}</span>
-              )}
+            <button className="primary" onClick={handleSimulate} disabled={loading}>
+              {loading ? <span className="spinner" /> : "Simulate"}
             </button>
             <p className="hint">
               {loading
                 ? "Grok is analyzing your tweet..."
-                : form.useAi
-                  ? "AI mode requires a local server."
-                  : "Enable Grok for deeper analysis."}
+                : "Run locally or use Grok for deeper analysis."}
             </p>
           </div>
         </section>
 
-        <section className="card results">
-          <div className="score-grid">
-            <div className="score">
+        <section className="panel score">
+          <div className="score-header">
+            <div>
               <p className="label">Virality score</p>
               <h2 style={{ color: scoreColor }}>{result.score.toFixed(1)}</h2>
               <span className="pill">{result.tier}</span>
             </div>
-            <div className="metrics">
-              <div>
-                <span>Weighted score</span>
-                <strong>{formatFloat(result.weightedScore, 2)}</strong>
-              </div>
-              <div>
-                <span>Total impressions</span>
-                <strong>{formatNumber(result.impressionsTotal)}</strong>
-              </div>
-              <div>
-                <span>In-network</span>
-                <strong>{formatNumber(result.impressionsIn)}</strong>
-              </div>
-              <div>
-                <span>Out-of-network</span>
-                <strong>{formatNumber(result.impressionsOon)}</strong>
-              </div>
+            <div className="score-meta">
+              <span>Weighted score</span>
+              <strong>{formatFloat(result.weightedScore, 2)}</strong>
+              <span>Total impressions</span>
+              <strong>{formatNumber(result.impressionsTotal)}</strong>
+              <span>In-network</span>
+              <strong>{formatNumber(result.impressionsIn)}</strong>
+              <span>Out-of-network</span>
+              <strong>{formatNumber(result.impressionsOon)}</strong>
             </div>
           </div>
 
@@ -503,72 +580,275 @@ function App() {
             )}
           </div>
         </section>
-      </main>
+      </div>
 
-      <aside className="insights">
-        <section className="card">
-          <div className="card-header">
-            <h3>Grok activity</h3>
-            <span className={loading ? "live" : "idle"}>
-              {loading ? "Running" : "Idle"}
-            </span>
+      <section className="panel under-hood">
+        <div className="under-hood-header">
+          <div>
+            <h3>Under the hood</h3>
+            <p>Live Grok status, transcript, and model signals.</p>
           </div>
-          <ul className="activity">
-            {activity.map((step) => (
-              <li key={step.label} className={step.status}>
-                <span className="dot" />
-                {step.label}
-              </li>
-            ))}
-          </ul>
-          {result.llmTrace && (
-            <div className="trace">
-              <p>
-                <strong>Model:</strong> {result.llmTrace.model}
-              </p>
-              <p>
-                <strong>Latency:</strong> {result.llmTrace.latency_ms} ms
-              </p>
-              <p>
-                <strong>Prompt:</strong> {result.llmTrace.prompt_summary}
-              </p>
-              <details>
-                <summary>Raw Grok response</summary>
-                <pre>{result.llmTrace.raw_response}</pre>
-              </details>
-              <div className="tokens">
-                <span>Prompt tokens: {formatOptional(result.llmTrace.prompt_tokens)}</span>
-                <span>Completion tokens: {formatOptional(result.llmTrace.completion_tokens)}</span>
-                <span>Total tokens: {formatOptional(result.llmTrace.total_tokens)}</span>
+          <button className="ghost" onClick={clearLogs}>
+            Clear logs
+          </button>
+        </div>
+
+        <div className="under-hood-grid">
+          <div className="hood-card">
+            <div className="card-header">
+              <h4>Grok activity</h4>
+              <span className={loading ? "live" : "idle"}>
+                {loading ? "Running" : "Idle"}
+              </span>
+            </div>
+            <ul className="activity">
+              {activity.map((step) => (
+                <li key={step.label} className={step.status}>
+                  <span className="dot" />
+                  {step.label}
+                </li>
+              ))}
+            </ul>
+            <div className="logs">
+              {logs.length === 0 ? (
+                <p>No live logs yet.</p>
+              ) : (
+                <ul>
+                  {logs.map((entry) => (
+                    <li key={entry.id}>
+                      <span>{entry.timestamp}</span>
+                      <strong>{entry.event}</strong>
+                      <span>{entry.message}</span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          </div>
+
+          <div className="hood-card transcript">
+            <div className="card-header">
+              <h4>Grok transcript</h4>
+              {result.llmTrace && (
+                <span>{result.llmTrace.model}</span>
+              )}
+            </div>
+            <div className="transcript-grid">
+              <div>
+                <h5>Parsed response</h5>
+                {result.llm ? (
+                  <div className="parsed-grid">
+                    <div>
+                      <span>Hook</span>
+                      <strong>{formatFloat(result.llm.hook, 2)}</strong>
+                    </div>
+                    <div>
+                      <span>Clarity</span>
+                      <strong>{formatFloat(result.llm.clarity, 2)}</strong>
+                    </div>
+                    <div>
+                      <span>Novelty</span>
+                      <strong>{formatFloat(result.llm.novelty, 2)}</strong>
+                    </div>
+                    <div>
+                      <span>Shareability</span>
+                      <strong>{formatFloat(result.llm.shareability, 2)}</strong>
+                    </div>
+                    <div>
+                      <span>Controversy</span>
+                      <strong>{formatFloat(result.llm.controversy, 2)}</strong>
+                    </div>
+                    <div>
+                      <span>Sentiment</span>
+                      <strong>{formatFloat(result.llm.sentiment, 2)}</strong>
+                    </div>
+                    <div className="parsed-list">
+                      <span>Suggestions</span>
+                      <ul>
+                        {result.llm.suggestions.map((item) => (
+                          <li key={item}>{item}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  </div>
+                ) : (
+                  <p className="muted">Run Grok to see parsed signals.</p>
+                )}
+              </div>
+              <div>
+                <h5>Raw response</h5>
+                {result.llmTrace ? (
+                  <pre>{result.llmTrace.raw_response}</pre>
+                ) : (
+                  <p className="muted">No raw response yet.</p>
+                )}
               </div>
             </div>
-          )}
-        </section>
-
-        <section className="card">
-          <h3>Signals</h3>
-          <SignalBar label="Quality" value={result.signals.contentQuality} />
-          <SignalBar label="Hook" value={result.signals.hook} />
-          <SignalBar label="Author" value={result.signals.authorQuality} />
-          <SignalBar label="Audience" value={result.signals.audienceAlignment} />
-          <SignalBar label="Share" value={result.signals.shareability} />
-          <SignalBar label="Risk" value={result.signals.negativeRisk} />
-        </section>
-
-        <section className="card">
-          <h3>Action probabilities</h3>
-          <div className="prob-grid">
-            {Object.entries(result.actions).map(([key, value]) => (
-              <div key={key}>
-                <span>{formatLabel(key)}</span>
-                <strong>{formatPercent(value)}</strong>
+            {result.llmTrace && (
+              <div className="trace-meta">
+                <span>Latency: {result.llmTrace.latency_ms} ms</span>
+                <span>Prompt: {result.llmTrace.prompt_summary}</span>
+                <span>Tokens: {formatOptional(result.llmTrace.total_tokens)}</span>
               </div>
-            ))}
+            )}
           </div>
-        </section>
-      </aside>
+
+          <div className="hood-card">
+            <div className="card-header">
+              <h4>Signals</h4>
+            </div>
+            <SignalBar label="Quality" value={result.signals.contentQuality} />
+            <SignalBar label="Hook" value={result.signals.hook} />
+            <SignalBar label="Author" value={result.signals.authorQuality} />
+            <SignalBar label="Audience" value={result.signals.audienceAlignment} />
+            <SignalBar label="Share" value={result.signals.shareability} />
+            <SignalBar label="Risk" value={result.signals.negativeRisk} />
+          </div>
+
+          <div className="hood-card">
+            <div className="card-header">
+              <h4>Action probabilities</h4>
+            </div>
+            <div className="prob-grid">
+              {Object.entries(result.actions).map(([key, value]) => (
+                <div key={key}>
+                  <span>{formatLabel(key)}</span>
+                  <strong>{formatPercent(value)}</strong>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <div className="hood-card">
+            <div className="card-header">
+              <h4>Snapshots</h4>
+            </div>
+            {snapshots.length === 0 ? (
+              <p className="muted">No snapshots saved yet.</p>
+            ) : (
+              <ul className="snapshot-list">
+                {snapshots.map((snapshot) => (
+                  <li key={snapshot.id}>
+                    <div>
+                      <strong>{snapshot.id}</strong>
+                      <span>{formatDate(snapshot.createdAt)}</span>
+                    </div>
+                    <div className="snapshot-actions">
+                      <button onClick={() => handleLoadSnapshot(snapshot)}>Load</button>
+                      <button onClick={() => handleDeleteSnapshot(snapshot.id)}>Delete</button>
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        </div>
+      </section>
     </div>
   );
+
+  function startStreaming(requestId: string) {
+    closeStream();
+    const source = new EventSource(`/api/simulate/stream?request_id=${requestId}`);
+    eventSourceRef.current = source;
+
+    source.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data) as {
+          event: string;
+          message: string;
+          timestamp_ms: number;
+        };
+        appendLog(data.event, data.message, data.timestamp_ms);
+        handleStreamEvent(data.event);
+      } catch {
+        appendLog("stream", "Received malformed stream event");
+      }
+    };
+
+    source.onerror = () => {
+      appendLog("error", "Stream connection lost");
+      setLoading(false);
+      closeStream();
+    };
+  }
+
+  function closeStream() {
+    if (eventSourceRef.current) {
+      eventSourceRef.current.close();
+      eventSourceRef.current = null;
+    }
+  }
+
+  function handleStreamEvent(event: string) {
+    if (event === "connected") {
+      return;
+    }
+    if (event === "start") {
+      updateActivity(0, "active");
+      return;
+    }
+    if (event === "calling") {
+      setActivity([
+        { label: "Preparing prompt", status: "done" },
+        { label: "Calling Grok API", status: "active" },
+        { label: "Merging signals", status: "pending" },
+      ]);
+      return;
+    }
+    if (event === "received") {
+      setActivity([
+        { label: "Preparing prompt", status: "done" },
+        { label: "Calling Grok API", status: "done" },
+        { label: "Merging signals", status: "active" },
+      ]);
+      return;
+    }
+    if (event === "merge") {
+      setActivity([
+        { label: "Preparing prompt", status: "done" },
+        { label: "Calling Grok API", status: "done" },
+        { label: "Merging signals", status: "active" },
+      ]);
+      return;
+    }
+    if (event === "done") {
+      setActivity([
+        { label: "Preparing prompt", status: "done" },
+        { label: "Calling Grok API", status: "done" },
+        { label: "Merging signals", status: "done" },
+      ]);
+      setLoading(false);
+      closeStream();
+      return;
+    }
+    if (event === "error") {
+      setActivity([
+        { label: "Preparing prompt", status: "done" },
+        { label: "Calling Grok API", status: "error" },
+        { label: "Merging signals", status: "pending" },
+      ]);
+      setLoading(false);
+      closeStream();
+    }
+  }
+
+  function appendLog(event: string, message: string, timestampMs?: number) {
+    const time = timestampMs ? new Date(timestampMs).toLocaleTimeString() : new Date().toLocaleTimeString();
+    const entry: LogEntry = {
+      id: generateSnapshotId(),
+      timestamp: time,
+      message,
+      event,
+    };
+    setLogs((prev) => [entry, ...prev].slice(0, LOG_LIMIT));
+  }
+
+  function updateActivity(index: number, status: ActivityStep["status"]) {
+    setActivity((prev) =>
+      prev.map((step, i) => (i === index ? { ...step, status } : step))
+    );
+  }
 }
 
 function Field({ label, children }: { label: string; children: ReactNode }) {
@@ -680,6 +960,17 @@ function normalizeApiResponse(raw: any): SimulationResult {
     },
     suggestions: raw.suggestions ?? [],
     warnings: raw.warnings ?? [],
+    llm: raw.llm
+      ? {
+          hook: raw.llm.hook,
+          clarity: raw.llm.clarity,
+          novelty: raw.llm.novelty,
+          shareability: raw.llm.shareability,
+          controversy: raw.llm.controversy,
+          sentiment: raw.llm.sentiment,
+          suggestions: raw.llm.suggestions ?? [],
+        }
+      : undefined,
     llmTrace: raw.llm_trace
       ? {
           model: raw.llm_trace.model,
@@ -691,6 +982,7 @@ function normalizeApiResponse(raw: any): SimulationResult {
           total_tokens: raw.llm_trace.total_tokens,
         }
       : undefined,
+    requestId: raw.request_id,
   };
 }
 
@@ -1121,6 +1413,10 @@ function formatOptional(value?: number | null) {
   return String(value);
 }
 
+function formatDate(value: string) {
+  return new Date(value).toLocaleString();
+}
+
 function countMatches(text: string, needle: string) {
   if (!needle) return 0;
   return text.split(needle).length - 1;
@@ -1134,51 +1430,30 @@ function isUpper(ch: string) {
   return /[A-Z]/.test(ch);
 }
 
-function tick(ms: number) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function generateSnapshotId() {
+  return Math.random().toString(36).slice(2, 8);
 }
 
-function HomeIcon() {
-  return (
-    <svg viewBox="0 0 24 24" aria-hidden>
-      <path d="M12 3l9 7v10a1 1 0 0 1-1 1h-6v-7H10v7H4a1 1 0 0 1-1-1V10l9-7z" />
-    </svg>
-  );
+function generateRequestId() {
+  return `req-${Date.now()}-${Math.random().toString(16).slice(2, 6)}`;
 }
 
-function SearchIcon() {
-  return (
-    <svg viewBox="0 0 24 24" aria-hidden>
-      <circle cx="11" cy="11" r="7" />
-      <path d="M16.5 16.5l4.5 4.5" />
-    </svg>
-  );
+function encodeSnapshot(snapshot: Snapshot) {
+  try {
+    const json = JSON.stringify(snapshot);
+    return btoa(unescape(encodeURIComponent(json)));
+  } catch {
+    return null;
+  }
 }
 
-function BellIcon() {
-  return (
-    <svg viewBox="0 0 24 24" aria-hidden>
-      <path d="M18 9a6 6 0 1 0-12 0c0 7-3 7-3 7h18s-3 0-3-7" />
-      <path d="M13.73 21a2 2 0 0 1-3.46 0" />
-    </svg>
-  );
-}
-
-function MailIcon() {
-  return (
-    <svg viewBox="0 0 24 24" aria-hidden>
-      <rect x="3" y="5" width="18" height="14" rx="2" />
-      <path d="M3 7l9 6 9-6" />
-    </svg>
-  );
-}
-
-function BookmarkIcon() {
-  return (
-    <svg viewBox="0 0 24 24" aria-hidden>
-      <path d="M6 3h12v18l-6-4-6 4V3z" />
-    </svg>
-  );
+function decodeSnapshot(encoded: string) {
+  try {
+    const json = decodeURIComponent(escape(atob(encoded)));
+    return JSON.parse(json) as Snapshot;
+  } catch {
+    return null;
+  }
 }
 
 export default App;

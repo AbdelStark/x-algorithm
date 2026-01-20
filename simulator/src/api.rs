@@ -6,6 +6,7 @@ use virality_sim::{
 #[derive(Debug, Deserialize)]
 pub struct ApiSimulationRequest {
     pub text: Option<String>,
+    pub request_id: Option<String>,
     pub media: Option<String>,
     pub has_link: Option<bool>,
     pub followers: Option<u64>,
@@ -92,6 +93,7 @@ impl ApiSimulationRequest {
 
 #[derive(Debug, Serialize)]
 pub struct ApiSimulationResponse {
+    pub request_id: String,
     pub score: f64,
     pub tier: String,
     pub weighted_score: f64,
@@ -111,8 +113,9 @@ pub struct ApiSimulationResponse {
 }
 
 impl ApiSimulationResponse {
-    pub fn from_output(output: SimulationOutput, warnings: Vec<String>) -> Self {
+    pub fn from_output(output: SimulationOutput, warnings: Vec<String>, request_id: String) -> Self {
         Self {
+            request_id,
             score: output.score,
             tier: output.tier.label().to_string(),
             weighted_score: output.weighted_score,
