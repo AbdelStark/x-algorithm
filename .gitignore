@@ -8,3 +8,5 @@ webapp/.vite/
 **/.env
 .tldr/
 .tldrignore
+.claude/tsc-cache/
+.claude/cache/
