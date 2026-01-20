@@ -8,10 +8,11 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     net::SocketAddr,
+    path::PathBuf,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -24,12 +25,14 @@ use tower_http::services::{ServeDir, ServeFile};
 
 use crate::api::{ApiSimulationRequest, ApiSimulationResponse};
 use crate::llm::LlmClient;
+use crate::snapshots::{Snapshot, SnapshotStore};
 use virality_sim::simulate_with_llm;
 
 #[derive(Clone)]
 struct AppState {
     llm_client: Option<LlmClient>,
     channels: Arc<Mutex<HashMap<String, broadcast::Sender<StreamEvent>>>>,
+    snapshots: Arc<SnapshotStore>,
 }
 
 #[derive(Clone, Serialize)]
@@ -47,9 +50,12 @@ struct StreamQuery {
 static REQUEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 pub async fn serve(args: crate::ServeArgs) -> Result<(), String> {
+    let snapshot_path = snapshot_path();
+    let snapshot_store = SnapshotStore::load(snapshot_path).await?;
     let state = AppState {
         llm_client: LlmClient::from_env(None),
         channels: Arc::new(Mutex::new(HashMap::new())),
+        snapshots: Arc::new(snapshot_store),
     };
 
     let web_root = args.web_root;
@@ -60,6 +66,8 @@ pub async fn serve(args: crate::ServeArgs) -> Result<(), String> {
         .route("/api/health", get(health))
         .route("/api/simulate", post(simulate_handler))
         .route("/api/simulate/stream", get(stream_handler))
+        .route("/api/snapshots", get(list_snapshots).post(create_snapshot))
+        .route("/api/snapshots/:id", get(get_snapshot).delete(delete_snapshot))
         .nest_service("/", static_service)
         .with_state(state);
 
@@ -106,7 +114,17 @@ async fn simulate_handler(
                 if let Some(sender) = channel.as_ref() {
                     send_event(sender, "calling", "Calling Grok API");
                 }
-                match client.score_text(&input.text).await {
+                let result = if let Some(sender) = channel.as_ref() {
+                    let token_sender = sender.clone();
+                    client
+                        .score_text_stream(&input.text, |chunk| {
+                            send_event(&token_sender, "token", chunk);
+                        })
+                        .await
+                } else {
+                    client.score_text(&input.text).await
+                };
+                match result {
                     Ok(result) => {
                         if let Some(sender) = channel.as_ref() {
                             send_event(sender, "received", "Received Grok response");
@@ -152,6 +170,65 @@ async fn simulate_handler(
     Ok(Json(response))
 }
 
+#[derive(Deserialize)]
+struct SnapshotRequest {
+    id: Option<String>,
+    created_at: Option<String>,
+    input: serde_json::Value,
+    output: serde_json::Value,
+}
+
+async fn list_snapshots(State(state): State<AppState>) -> Result<Json<Vec<Snapshot>>, StatusCode> {
+    let snapshots = state.snapshots.list().await;
+    Ok(Json(snapshots))
+}
+
+async fn get_snapshot(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<Snapshot>, (StatusCode, String)> {
+    match state.snapshots.get(&id).await {
+        Some(snapshot) => Ok(Json(snapshot)),
+        None => Err((StatusCode::NOT_FOUND, "Snapshot not found".to_string())),
+    }
+}
+
+async fn create_snapshot(
+    State(state): State<AppState>,
+    Json(payload): Json<SnapshotRequest>,
+) -> Result<Json<Snapshot>, (StatusCode, String)> {
+    let snapshot = Snapshot {
+        id: payload.id.unwrap_or_else(generate_snapshot_id),
+        created_at: payload
+            .created_at
+            .unwrap_or_else(|| chrono_like_timestamp()),
+        input: payload.input,
+        output: payload.output,
+    };
+    let saved = state
+        .snapshots
+        .add(snapshot)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err))?;
+    Ok(Json(saved))
+}
+
+async fn delete_snapshot(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let removed = state
+        .snapshots
+        .delete(&id)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err))?;
+    if removed {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err((StatusCode::NOT_FOUND, "Snapshot not found".to_string()))
+    }
+}
+
 async fn stream_handler(
     State(state): State<AppState>,
     Query(query): Query<StreamQuery>,
@@ -181,7 +258,7 @@ async fn get_or_create_channel(
     if let Some(sender) = guard.get(request_id) {
         return sender.clone();
     }
-    let (sender, _) = broadcast::channel(32);
+    let (sender, _) = broadcast::channel(256);
     guard.insert(request_id.to_string(), sender.clone());
     sender
 }
@@ -207,9 +284,25 @@ fn generate_request_id() -> String {
     format!("req-{}-{}", now_ms(), counter)
 }
 
+fn generate_snapshot_id() -> String {
+    let counter = REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("snap-{}-{}", now_ms(), counter)
+}
+
 fn now_ms() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis())
         .unwrap_or(0)
+}
+
+fn snapshot_path() -> PathBuf {
+    if let Ok(path) = std::env::var("SIM_SNAPSHOT_PATH") {
+        return PathBuf::from(path);
+    }
+    PathBuf::from("data").join("snapshots.json")
+}
+
+fn chrono_like_timestamp() -> String {
+    now_ms().to_string()
 }

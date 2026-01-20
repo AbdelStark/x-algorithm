@@ -2,6 +2,7 @@ use reqwest::header::AUTHORIZATION;
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::time::Instant;
+use tokio_stream::StreamExt;
 use virality_sim::{LlmScore, LlmTrace};
 
 #[derive(Clone)]
@@ -36,19 +37,12 @@ impl LlmClient {
 
     pub async fn score_text(&self, text: &str) -> Result<LlmResult, String> {
         let url = format!("{}/chat/completions", self.api_base.trim_end_matches('/'));
+        let (messages, prompt) = build_messages(text);
         let request = ChatRequest {
             model: self.model.clone(),
             temperature: 0.2,
-            messages: vec![
-                ChatMessage {
-                    role: "system".to_string(),
-                    content: system_prompt(),
-                },
-                ChatMessage {
-                    role: "user".to_string(),
-                    content: format!("Tweet:\n{}", text),
-                },
-            ],
+            messages,
+            stream: None,
         };
 
         let started = Instant::now();
@@ -88,29 +82,121 @@ impl LlmClient {
             .trim()
             .to_string();
 
-        let json = extract_json(&content).ok_or_else(|| "xAI response missing JSON".to_string())?;
-        let mut score: LlmScore = serde_json::from_str(&json)
-            .map_err(|err| format!("xAI JSON parse failed: {}", err))?;
-
-        score.hook = clamp01(score.hook);
-        score.clarity = clamp01(score.clarity);
-        score.novelty = clamp01(score.novelty);
-        score.shareability = clamp01(score.shareability);
-        score.controversy = clamp01(score.controversy);
-        score.sentiment = score.sentiment.max(-1.0).min(1.0);
-        score.suggestions = score
-            .suggestions
-            .into_iter()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .take(6)
-            .collect();
-
+        let score = parse_score(&content)?;
         let usage = body.usage.unwrap_or_default();
         let trace = LlmTrace {
             model: body.model.unwrap_or_else(|| self.model.clone()),
             latency_ms: started.elapsed().as_millis(),
             prompt_summary: prompt_summary(),
+            prompt,
+            raw_response: content,
+            prompt_tokens: usage.prompt_tokens,
+            completion_tokens: usage.completion_tokens,
+            total_tokens: usage.total_tokens,
+        };
+
+        Ok(LlmResult { score, trace })
+    }
+
+    pub async fn score_text_stream<F>(
+        &self,
+        text: &str,
+        mut on_token: F,
+    ) -> Result<LlmResult, String>
+    where
+        F: FnMut(&str) + Send,
+    {
+        let url = format!("{}/chat/completions", self.api_base.trim_end_matches('/'));
+        let (messages, prompt) = build_messages(text);
+        let request = ChatRequest {
+            model: self.model.clone(),
+            temperature: 0.2,
+            messages,
+            stream: Some(true),
+        };
+
+        let started = Instant::now();
+        let response = self
+            .client
+            .post(url)
+            .header(AUTHORIZATION, format!("Bearer {}", self.api_key))
+            .json(&request)
+            .send()
+            .await
+            .map_err(|err| format!("xAI request failed: {}", err))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let error_body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| String::new());
+            let detail = error_body.trim();
+            if detail.is_empty() {
+                return Err(format!("xAI API error: {}", status));
+            }
+            return Err(format!("xAI API error: {} {}", status, detail));
+        }
+
+        let mut stream = response.bytes_stream();
+        let mut buffer = String::new();
+        let mut content = String::new();
+        let mut model: Option<String> = None;
+        let mut usage = ChatUsage::default();
+
+        'outer: while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|err| format!("xAI stream failed: {}", err))?;
+            let text_chunk = String::from_utf8_lossy(&chunk);
+            buffer.push_str(&text_chunk);
+
+            while let Some(pos) = buffer.find('\n') {
+                let line = buffer[..pos].trim_end_matches('\r').to_string();
+                buffer = buffer[pos + 1..].to_string();
+                let line = line.trim();
+                if !line.starts_with("data:") {
+                    continue;
+                }
+                let data = line.trim_start_matches("data:").trim();
+                if data.is_empty() {
+                    continue;
+                }
+                if data == "[DONE]" {
+                    break 'outer;
+                }
+
+                let event: ChatStreamResponse = serde_json::from_str(data)
+                    .map_err(|err| format!("xAI stream parse failed: {}", err))?;
+                if let Some(model_value) = event.model {
+                    model = Some(model_value);
+                }
+                if let Some(usage_value) = event.usage {
+                    usage = usage_value;
+                }
+                if let Some(delta) = event
+                    .choices
+                    .first()
+                    .and_then(|choice| choice.delta.content.as_deref())
+                {
+                    content.push_str(delta);
+                    on_token(delta);
+                }
+                if event
+                    .choices
+                    .first()
+                    .and_then(|choice| choice.finish_reason.as_deref())
+                    == Some("stop")
+                {
+                    break 'outer;
+                }
+            }
+        }
+
+        let score = parse_score(&content)?;
+        let trace = LlmTrace {
+            model: model.unwrap_or_else(|| self.model.clone()),
+            latency_ms: started.elapsed().as_millis(),
+            prompt_summary: prompt_summary(),
+            prompt,
             raw_response: content,
             prompt_tokens: usage.prompt_tokens,
             completion_tokens: usage.completion_tokens,
@@ -126,6 +212,8 @@ struct ChatRequest {
     model: String,
     messages: Vec<ChatMessage>,
     temperature: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -158,6 +246,24 @@ struct ChatUsage {
     total_tokens: Option<u32>,
 }
 
+#[derive(Deserialize)]
+struct ChatStreamResponse {
+    choices: Vec<ChatStreamChoice>,
+    model: Option<String>,
+    usage: Option<ChatUsage>,
+}
+
+#[derive(Deserialize)]
+struct ChatStreamChoice {
+    delta: ChatStreamDelta,
+    finish_reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ChatStreamDelta {
+    content: Option<String>,
+}
+
 fn system_prompt() -> String {
     let prompt = r#"You are a strict JSON-only scorer for tweet virality signals.
 Return a single JSON object with these fields:
@@ -177,6 +283,45 @@ Rules:
 
 fn prompt_summary() -> String {
     "Scores hook, clarity, novelty, shareability, controversy, sentiment + suggestions.".to_string()
+}
+
+fn build_messages(text: &str) -> (Vec<ChatMessage>, String) {
+    let system = system_prompt();
+    let user = format!("Tweet:\n{}", text);
+    let prompt = format!("System:\n{}\n\nUser:\n{}", system, user);
+    let messages = vec![
+        ChatMessage {
+            role: "system".to_string(),
+            content: system,
+        },
+        ChatMessage {
+            role: "user".to_string(),
+            content: user,
+        },
+    ];
+    (messages, prompt)
+}
+
+fn parse_score(content: &str) -> Result<LlmScore, String> {
+    let json = extract_json(content).ok_or_else(|| "xAI response missing JSON".to_string())?;
+    let mut score: LlmScore = serde_json::from_str(&json)
+        .map_err(|err| format!("xAI JSON parse failed: {}", err))?;
+
+    score.hook = clamp01(score.hook);
+    score.clarity = clamp01(score.clarity);
+    score.novelty = clamp01(score.novelty);
+    score.shareability = clamp01(score.shareability);
+    score.controversy = clamp01(score.controversy);
+    score.sentiment = score.sentiment.max(-1.0).min(1.0);
+    score.suggestions = score
+        .suggestions
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .take(6)
+        .collect();
+
+    Ok(score)
 }
 
 fn extract_json(text: &str) -> Option<String> {

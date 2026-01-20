@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 
-const SNAPSHOT_KEY = "viralitySnapshots";
 const LOG_LIMIT = 80;
+const TRANSCRIPT_LIMIT = 6000;
 
 type MediaType = "none" | "image" | "video" | "gif";
 
@@ -53,6 +53,7 @@ type LlmTrace = {
   model: string;
   latency_ms: number;
   prompt_summary: string;
+  prompt: string;
   raw_response: string;
   prompt_tokens?: number | null;
   completion_tokens?: number | null;
@@ -96,6 +97,13 @@ type Snapshot = {
   createdAt: string;
   input: FormState;
   output: SimulationResult;
+};
+
+type CompareRow = {
+  label: string;
+  left: number;
+  right: number;
+  format: (value: number) => string;
 };
 
 type FormState = {
@@ -152,9 +160,23 @@ function App() {
   const [alerts, setAlerts] = useState<string[]>([]);
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [snapshots, setSnapshots] = useState<Snapshot[]>([]);
+  const [liveTranscript, setLiveTranscript] = useState("");
+  const [activeSnapshotId, setActiveSnapshotId] = useState<string | null>(null);
+  const [compareLeftId, setCompareLeftId] = useState<string | null>(null);
+  const [compareRightId, setCompareRightId] = useState<string | null>(null);
   const eventSourceRef = useRef<EventSource | null>(null);
 
   const charCount = form.text.length;
+  const transcriptText = result.llmTrace?.raw_response || liveTranscript;
+  const promptText = result.llmTrace?.prompt || result.llmTrace?.prompt_summary || "";
+  const compareLeft = useMemo(
+    () => snapshots.find((item) => item.id === compareLeftId) ?? null,
+    [snapshots, compareLeftId]
+  );
+  const compareRight = useMemo(
+    () => snapshots.find((item) => item.id === compareRightId) ?? null,
+    [snapshots, compareRightId]
+  );
 
   const scoreColor = useMemo(() => {
     if (result.score >= 80) return "var(--accent)";
@@ -164,40 +186,72 @@ function App() {
   }, [result.score]);
 
   useEffect(() => {
-    const stored = localStorage.getItem(SNAPSHOT_KEY);
-    if (stored) {
+    let cancelled = false;
+    const load = async () => {
       try {
-        const parsed = JSON.parse(stored) as Snapshot[];
-        setSnapshots(parsed);
+        const response = await fetch("/api/snapshots");
+        if (!response.ok) {
+          return;
+        }
+        const data = await response.json();
+        if (cancelled) return;
+        const normalized = normalizeSnapshots(data);
+        setSnapshots(normalized);
       } catch {
-        setSnapshots([]);
+        if (!cancelled) {
+          setSnapshots([]);
+        }
       }
-    }
+    };
+    load();
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   useEffect(() => {
-    localStorage.setItem(SNAPSHOT_KEY, JSON.stringify(snapshots.slice(0, 20)));
-  }, [snapshots]);
-
-  useEffect(() => {
     const params = new URLSearchParams(window.location.search);
+    const snapshotId = params.get("snapshot_id");
+    if (snapshotId) {
+      void loadSnapshotById(snapshotId);
+      return;
+    }
     const snapshotParam = params.get("snapshot");
     if (!snapshotParam) return;
     const decoded = decodeSnapshot(snapshotParam);
     if (!decoded) return;
     setForm(decoded.input);
     setResult(decoded.output);
+    setActiveSnapshotId(decoded.id ?? null);
     setAlerts(["Loaded shared snapshot."]);
   }, []);
 
+  useEffect(() => {
+    if (snapshots.length === 0) {
+      setCompareLeftId(null);
+      setCompareRightId(null);
+      return;
+    }
+    if (!compareLeftId || !snapshots.some((item) => item.id === compareLeftId)) {
+      setCompareLeftId(snapshots[0].id);
+    }
+    if (!compareRightId || !snapshots.some((item) => item.id === compareRightId)) {
+      setCompareRightId(snapshots[1]?.id ?? snapshots[0].id);
+    }
+  }, [snapshots, compareLeftId, compareRightId]);
+
   const handleSimulate = async () => {
     setAlerts([]);
+    setActiveSnapshotId(null);
+    setLiveTranscript("");
     if (!form.text.trim()) {
       setAlerts(["Add tweet text to simulate."]);
       return;
     }
 
     if (!form.useAi) {
+      closeStream();
+      setLoading(false);
       const local = simulateLocal(form);
       setResult(local);
       setActivity(INITIAL_ACTIVITY);
@@ -274,30 +328,25 @@ function App() {
     }
   };
 
-  const handleSaveSnapshot = () => {
-    const snapshot: Snapshot = {
-      id: generateSnapshotId(),
-      createdAt: new Date().toISOString(),
-      input: form,
-      output: result,
-    };
-    setSnapshots((prev) => [snapshot, ...prev].slice(0, 20));
-    appendLog("snapshot", `Snapshot saved (${snapshot.id})`);
+  const handleSaveSnapshot = async () => {
+    const saved = await createSnapshot();
+    if (saved) {
+      setAlerts(["Snapshot saved."]);
+      appendLog("snapshot", `Snapshot saved (${saved.id})`);
+    }
   };
 
   const handleShareSnapshot = async () => {
-    const snapshot: Snapshot = {
-      id: generateSnapshotId(),
-      createdAt: new Date().toISOString(),
-      input: form,
-      output: result,
-    };
-    const encoded = encodeSnapshot(snapshot);
-    if (!encoded) {
-      setAlerts(["Unable to generate share link."]);
+    let shareId = activeSnapshotId;
+    if (!shareId) {
+      const saved = await createSnapshot();
+      shareId = saved?.id ?? null;
+    }
+    if (!shareId) {
+      setAlerts(["Unable to create snapshot for sharing."]);
       return;
     }
-    const url = `${window.location.origin}${window.location.pathname}?snapshot=${encoded}`;
+    const url = `${window.location.origin}${window.location.pathname}?snapshot_id=${shareId}`;
     try {
       await navigator.clipboard.writeText(url);
       setAlerts(["Share link copied to clipboard."]);
@@ -310,14 +359,95 @@ function App() {
   const handleLoadSnapshot = (snapshot: Snapshot) => {
     setForm(snapshot.input);
     setResult(snapshot.output);
+    setActiveSnapshotId(snapshot.id);
+    setLiveTranscript("");
+    setActivity(INITIAL_ACTIVITY);
+    setLoading(false);
+    closeStream();
     setAlerts(["Snapshot loaded."]);
   };
 
-  const handleDeleteSnapshot = (snapshotId: string) => {
-    setSnapshots((prev) => prev.filter((item) => item.id !== snapshotId));
+  const handleDeleteSnapshot = async (snapshotId: string) => {
+    try {
+      const response = await fetch(`/api/snapshots/${snapshotId}`, {
+        method: "DELETE",
+      });
+      if (!response.ok && response.status !== 404) {
+        setAlerts([`Failed to delete snapshot (${response.status}).`]);
+        return;
+      }
+      setSnapshots((prev) => prev.filter((item) => item.id !== snapshotId));
+      if (activeSnapshotId === snapshotId) {
+        setActiveSnapshotId(null);
+      }
+    } catch {
+      setAlerts(["Failed to delete snapshot."]);
+    }
   };
 
   const clearLogs = () => setLogs([]);
+
+  async function createSnapshot(): Promise<Snapshot | null> {
+    try {
+      const response = await fetch("/api/snapshots", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          input: form,
+          output: result,
+        }),
+      });
+      if (!response.ok) {
+        setAlerts([`Snapshot save failed (${response.status}).`]);
+        return null;
+      }
+      const data = await response.json();
+      const snapshot = normalizeSnapshot(data);
+      if (!snapshot) {
+        setAlerts(["Snapshot parsing failed."]);
+        return null;
+      }
+      setSnapshots((prev) => {
+        const next = [snapshot, ...prev.filter((item) => item.id !== snapshot.id)];
+        return next.slice(0, 50);
+      });
+      setActiveSnapshotId(snapshot.id);
+      return snapshot;
+    } catch {
+      setAlerts(["Snapshot save failed."]);
+      return null;
+    }
+  }
+
+  async function loadSnapshotById(snapshotId: string) {
+    try {
+      const response = await fetch(`/api/snapshots/${snapshotId}`);
+      if (!response.ok) {
+        setAlerts(["Shared snapshot not found."]);
+        return;
+      }
+      const data = await response.json();
+      const snapshot = normalizeSnapshot(data);
+      if (!snapshot) {
+        setAlerts(["Shared snapshot parsing failed."]);
+        return;
+      }
+      setForm(snapshot.input);
+      setResult(snapshot.output);
+      setActiveSnapshotId(snapshot.id);
+      setLiveTranscript("");
+      setActivity(INITIAL_ACTIVITY);
+      setLoading(false);
+      closeStream();
+      setSnapshots((prev) => {
+        const next = [snapshot, ...prev.filter((item) => item.id !== snapshot.id)];
+        return next.slice(0, 50);
+      });
+      setAlerts(["Loaded shared snapshot."]);
+    } catch {
+      setAlerts(["Failed to load shared snapshot."]);
+    }
+  }
 
   return (
     <div className="app">
@@ -635,54 +765,62 @@ function App() {
             </div>
             <div className="transcript-grid">
               <div>
-                <h5>Parsed response</h5>
-                {result.llm ? (
-                  <div className="parsed-grid">
-                    <div>
-                      <span>Hook</span>
-                      <strong>{formatFloat(result.llm.hook, 2)}</strong>
-                    </div>
-                    <div>
-                      <span>Clarity</span>
-                      <strong>{formatFloat(result.llm.clarity, 2)}</strong>
-                    </div>
-                    <div>
-                      <span>Novelty</span>
-                      <strong>{formatFloat(result.llm.novelty, 2)}</strong>
-                    </div>
-                    <div>
-                      <span>Shareability</span>
-                      <strong>{formatFloat(result.llm.shareability, 2)}</strong>
-                    </div>
-                    <div>
-                      <span>Controversy</span>
-                      <strong>{formatFloat(result.llm.controversy, 2)}</strong>
-                    </div>
-                    <div>
-                      <span>Sentiment</span>
-                      <strong>{formatFloat(result.llm.sentiment, 2)}</strong>
-                    </div>
-                    <div className="parsed-list">
-                      <span>Suggestions</span>
-                      <ul>
-                        {result.llm.suggestions.map((item) => (
-                          <li key={item}>{item}</li>
-                        ))}
-                      </ul>
-                    </div>
-                  </div>
+                <h5>Prompt context</h5>
+                {promptText ? (
+                  <pre>{promptText}</pre>
                 ) : (
-                  <p className="muted">Run Grok to see parsed signals.</p>
+                  <p className="muted">No prompt captured yet.</p>
                 )}
               </div>
               <div>
-                <h5>Raw response</h5>
-                {result.llmTrace ? (
-                  <pre>{result.llmTrace.raw_response}</pre>
+                <h5>Response (streaming)</h5>
+                {transcriptText ? (
+                  <pre>{transcriptText}</pre>
                 ) : (
-                  <p className="muted">No raw response yet.</p>
+                  <p className="muted">No response yet.</p>
                 )}
               </div>
+            </div>
+            <div className="parsed-block">
+              <h5>Parsed response</h5>
+              {result.llm ? (
+                <div className="parsed-grid">
+                  <div>
+                    <span>Hook</span>
+                    <strong>{formatFloat(result.llm.hook, 2)}</strong>
+                  </div>
+                  <div>
+                    <span>Clarity</span>
+                    <strong>{formatFloat(result.llm.clarity, 2)}</strong>
+                  </div>
+                  <div>
+                    <span>Novelty</span>
+                    <strong>{formatFloat(result.llm.novelty, 2)}</strong>
+                  </div>
+                  <div>
+                    <span>Shareability</span>
+                    <strong>{formatFloat(result.llm.shareability, 2)}</strong>
+                  </div>
+                  <div>
+                    <span>Controversy</span>
+                    <strong>{formatFloat(result.llm.controversy, 2)}</strong>
+                  </div>
+                  <div>
+                    <span>Sentiment</span>
+                    <strong>{formatFloat(result.llm.sentiment, 2)}</strong>
+                  </div>
+                  <div className="parsed-list">
+                    <span>Suggestions</span>
+                    <ul>
+                      {result.llm.suggestions.map((item) => (
+                        <li key={item}>{item}</li>
+                      ))}
+                    </ul>
+                  </div>
+                </div>
+              ) : (
+                <p className="muted">Run Grok to see parsed signals.</p>
+              )}
             </div>
             {result.llmTrace && (
               <div className="trace-meta">
@@ -742,6 +880,61 @@ function App() {
               </ul>
             )}
           </div>
+
+          <div className="hood-card compare">
+            <div className="card-header">
+              <h4>Snapshot compare</h4>
+            </div>
+            {snapshots.length < 2 || !compareLeft || !compareRight ? (
+              <p className="muted">Save at least two snapshots to compare.</p>
+            ) : (
+              <>
+                <div className="compare-select">
+                  <label>
+                    <span>Snapshot A</span>
+                    <select
+                      value={compareLeftId ?? ""}
+                      onChange={(event) => setCompareLeftId(event.target.value)}
+                    >
+                      {snapshots.map((item) => (
+                        <option key={item.id} value={item.id}>
+                          {item.id}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label>
+                    <span>Snapshot B</span>
+                    <select
+                      value={compareRightId ?? ""}
+                      onChange={(event) => setCompareRightId(event.target.value)}
+                    >
+                      {snapshots.map((item) => (
+                        <option key={item.id} value={item.id}>
+                          {item.id}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                </div>
+                <div className="compare-grid">
+                  {buildCompareRows(compareLeft, compareRight).map((row) => {
+                    const delta = row.right - row.left;
+                    const deltaLabel = formatDelta(delta, row.format);
+                    const deltaClass = delta > 0 ? "up" : delta < 0 ? "down" : "flat";
+                    return (
+                      <div className="compare-row" key={row.label}>
+                        <span>{row.label}</span>
+                        <strong>{row.format(row.left)}</strong>
+                        <strong>{row.format(row.right)}</strong>
+                        <span className={`delta ${deltaClass}`}>{deltaLabel}</span>
+                      </div>
+                    );
+                  })}
+                </div>
+              </>
+            )}
+          </div>
         </div>
       </section>
     </div>
@@ -759,6 +952,10 @@ function App() {
           message: string;
           timestamp_ms: number;
         };
+        if (data.event === "token") {
+          appendToken(data.message);
+          return;
+        }
         appendLog(data.event, data.message, data.timestamp_ms);
         handleStreamEvent(data.event);
       } catch {
@@ -782,6 +979,9 @@ function App() {
 
   function handleStreamEvent(event: string) {
     if (event === "connected") {
+      return;
+    }
+    if (event === "token") {
       return;
     }
     if (event === "start") {
@@ -842,6 +1042,14 @@ function App() {
       event,
     };
     setLogs((prev) => [entry, ...prev].slice(0, LOG_LIMIT));
+  }
+
+  function appendToken(chunk: string) {
+    if (!chunk) return;
+    setLiveTranscript((prev) => {
+      const next = prev + chunk;
+      return next.length > TRANSCRIPT_LIMIT ? next.slice(-TRANSCRIPT_LIMIT) : next;
+    });
   }
 
   function updateActivity(index: number, status: ActivityStep["status"]) {
@@ -976,6 +1184,7 @@ function normalizeApiResponse(raw: any): SimulationResult {
           model: raw.llm_trace.model,
           latency_ms: raw.llm_trace.latency_ms,
           prompt_summary: raw.llm_trace.prompt_summary,
+          prompt: raw.llm_trace.prompt ?? "",
           raw_response: raw.llm_trace.raw_response,
           prompt_tokens: raw.llm_trace.prompt_tokens,
           completion_tokens: raw.llm_trace.completion_tokens,
@@ -984,6 +1193,132 @@ function normalizeApiResponse(raw: any): SimulationResult {
       : undefined,
     requestId: raw.request_id,
   };
+}
+
+function normalizeSnapshots(raw: any): Snapshot[] {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .map((item) => normalizeSnapshot(item))
+    .filter((item): item is Snapshot => Boolean(item));
+}
+
+function normalizeSnapshot(raw: any): Snapshot | null {
+  if (!raw || typeof raw !== "object") return null;
+  return {
+    id: raw.id ?? generateSnapshotId(),
+    createdAt: raw.created_at ?? raw.createdAt ?? new Date().toISOString(),
+    input: normalizeSnapshotInput(raw.input ?? raw),
+    output: normalizeSnapshotOutput(raw.output ?? raw),
+  };
+}
+
+function normalizeSnapshotInput(raw: any): FormState {
+  if (!raw || typeof raw !== "object") return { ...DEFAULT_FORM };
+  const mediaValue = raw.media ?? DEFAULT_FORM.media;
+  const media =
+    mediaValue === "image" || mediaValue === "video" || mediaValue === "gif"
+      ? mediaValue
+      : "none";
+  return {
+    text: raw.text ?? DEFAULT_FORM.text,
+    followers: Number(raw.followers ?? DEFAULT_FORM.followers),
+    following: Number(raw.following ?? DEFAULT_FORM.following),
+    accountAgeDays: Number(raw.accountAgeDays ?? raw.account_age_days ?? DEFAULT_FORM.accountAgeDays),
+    avgEngagementRate: Number(raw.avgEngagementRate ?? raw.avg_engagement_rate ?? DEFAULT_FORM.avgEngagementRate),
+    postsPerDay: Number(raw.postsPerDay ?? raw.posts_per_day ?? DEFAULT_FORM.postsPerDay),
+    hourOfDay: Number(raw.hourOfDay ?? raw.hour_of_day ?? DEFAULT_FORM.hourOfDay),
+    media,
+    hasLink: Boolean(raw.hasLink ?? raw.has_link ?? DEFAULT_FORM.hasLink),
+    verified: Boolean(raw.verified ?? DEFAULT_FORM.verified),
+    novelty: Number(raw.novelty ?? DEFAULT_FORM.novelty),
+    timeliness: Number(raw.timeliness ?? DEFAULT_FORM.timeliness),
+    audienceFit: Number(raw.audienceFit ?? raw.audience_fit ?? DEFAULT_FORM.audienceFit),
+    topicSaturation: Number(raw.topicSaturation ?? raw.topic_saturation ?? DEFAULT_FORM.topicSaturation),
+    controversy: Number(raw.controversy ?? DEFAULT_FORM.controversy),
+    sentiment: Number(raw.sentiment ?? DEFAULT_FORM.sentiment),
+    useAi: Boolean(raw.useAi ?? raw.use_ai ?? DEFAULT_FORM.useAi),
+  };
+}
+
+function normalizeSnapshotOutput(raw: any): SimulationResult {
+  if (!raw || typeof raw !== "object") return simulateLocal(DEFAULT_FORM);
+  if ("weightedScore" in raw && "score" in raw) {
+    return raw as SimulationResult;
+  }
+  return normalizeApiResponse(raw);
+}
+
+function buildCompareRows(left: Snapshot, right: Snapshot): CompareRow[] {
+  const leftOutput = left.output;
+  const rightOutput = right.output;
+  return [
+    {
+      label: "Virality score",
+      left: leftOutput.score,
+      right: rightOutput.score,
+      format: (value) => value.toFixed(1),
+    },
+    {
+      label: "Weighted score",
+      left: leftOutput.weightedScore,
+      right: rightOutput.weightedScore,
+      format: (value) => value.toFixed(2),
+    },
+    {
+      label: "Total impressions",
+      left: leftOutput.impressionsTotal,
+      right: rightOutput.impressionsTotal,
+      format: formatNumber,
+    },
+    {
+      label: "In-network impressions",
+      left: leftOutput.impressionsIn,
+      right: rightOutput.impressionsIn,
+      format: formatNumber,
+    },
+    {
+      label: "Out-of-network impressions",
+      left: leftOutput.impressionsOon,
+      right: rightOutput.impressionsOon,
+      format: formatNumber,
+    },
+    {
+      label: "Unique engaged",
+      left: leftOutput.expectedUniqueEngagements,
+      right: rightOutput.expectedUniqueEngagements,
+      format: formatNumber,
+    },
+    {
+      label: "Action volume",
+      left: leftOutput.expectedActionVolume,
+      right: rightOutput.expectedActionVolume,
+      format: formatNumber,
+    },
+    {
+      label: "Likes",
+      left: leftOutput.impressionsTotal * leftOutput.actions.like,
+      right: rightOutput.impressionsTotal * rightOutput.actions.like,
+      format: formatNumber,
+    },
+    {
+      label: "Replies",
+      left: leftOutput.impressionsTotal * leftOutput.actions.reply,
+      right: rightOutput.impressionsTotal * rightOutput.actions.reply,
+      format: formatNumber,
+    },
+    {
+      label: "Reposts",
+      left: leftOutput.impressionsTotal * leftOutput.actions.repost,
+      right: rightOutput.impressionsTotal * rightOutput.actions.repost,
+      format: formatNumber,
+    },
+    {
+      label: "Shares",
+      left: leftOutput.impressionsTotal * leftOutput.actions.share,
+      right: rightOutput.impressionsTotal * rightOutput.actions.share,
+      format: formatNumber,
+    },
+  ];
 }
 
 function simulateLocal(form: FormState): SimulationResult {
@@ -1404,6 +1739,12 @@ function formatFloat(value: number, digits: number) {
   return value.toFixed(digits);
 }
 
+function formatDelta(value: number, formatter: (value: number) => string) {
+  if (value === 0) return "0";
+  const sign = value > 0 ? "+" : "-";
+  return `${sign}${formatter(Math.abs(value))}`;
+}
+
 function formatLabel(value: string) {
   return value.replace(/([A-Z])/g, " $1").replace(/^\w/, (c) => c.toUpperCase());
 }
@@ -1414,6 +1755,10 @@ function formatOptional(value?: number | null) {
 }
 
 function formatDate(value: string) {
+  const numeric = Number(value);
+  if (!Number.isNaN(numeric) && value.trim() !== "") {
+    return new Date(numeric).toLocaleString();
+  }
   return new Date(value).toLocaleString();
 }
 
@@ -1450,7 +1795,7 @@ function encodeSnapshot(snapshot: Snapshot) {
 function decodeSnapshot(encoded: string) {
   try {
     const json = decodeURIComponent(escape(atob(encoded)));
-    return JSON.parse(json) as Snapshot;
+    return normalizeSnapshot(JSON.parse(json));
   } catch {
     return null;
   }

@@ -123,6 +123,7 @@ pub struct LlmTrace {
     pub model: String,
     pub latency_ms: u128,
     pub prompt_summary: String,
+    pub prompt: String,
     pub raw_response: String,
     pub prompt_tokens: Option<u32>,
     pub completion_tokens: Option<u32>,
