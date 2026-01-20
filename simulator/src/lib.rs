@@ -1,5 +1,14 @@
+pub mod config;
+pub mod calibration;
+pub mod phoenix_client;
+pub mod scoring;
+pub mod user;
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+
+use crate::config::ScoringConfig;
+use crate::scoring::{AuthorDiversityScorer, OonScorer, ScoredCandidate, ScoringPipeline, WeightedScorer};
 
 #[derive(Debug, Clone, Copy)]
 pub enum MediaType {
@@ -50,6 +59,10 @@ impl MediaType {
 pub struct SimulatorInput {
     pub text: String,
     pub media: MediaType,
+    pub post_id: Option<String>,
+    pub author_id: Option<String>,
+    pub is_oon: bool,
+    pub video_duration_seconds: Option<f64>,
     pub has_link_override: Option<bool>,
     pub followers: u64,
     pub following: u64,
@@ -71,6 +84,10 @@ impl Default for SimulatorInput {
         Self {
             text: String::new(),
             media: MediaType::None,
+            post_id: None,
+            author_id: None,
+            is_oon: false,
+            video_duration_seconds: None,
             has_link_override: None,
             followers: 1_000,
             following: 500,
@@ -157,12 +174,41 @@ pub struct ActionProbs {
     pub video_view: f64,
     pub photo_expand: f64,
     pub share: f64,
+    pub share_dm: f64,
+    pub share_link: f64,
     pub dwell: f64,
     pub follow_author: f64,
+    pub quoted_click: f64,
     pub not_interested: f64,
     pub block: f64,
     pub mute: f64,
     pub report: f64,
+    pub dwell_time: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum ScoringMode {
+    Heuristic,
+    Phoenix,
+    Hybrid { phoenix_weight: f64 },
+}
+
+impl ScoringMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            ScoringMode::Heuristic => "heuristic",
+            ScoringMode::Phoenix => "phoenix",
+            ScoringMode::Hybrid { .. } => "hybrid",
+        }
+    }
+
+    pub fn phoenix_weight(self) -> f64 {
+        match self {
+            ScoringMode::Hybrid { phoenix_weight } => phoenix_weight,
+            ScoringMode::Phoenix => 1.0,
+            ScoringMode::Heuristic => 0.0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -190,7 +236,11 @@ impl ViralityTier {
 pub struct SimulationOutput {
     pub score: f64,
     pub tier: ViralityTier,
+    pub scoring_mode: ScoringMode,
     pub weighted_score: f64,
+    pub diversity_multiplier: f64,
+    pub oon_multiplier: f64,
+    pub final_score: f64,
     pub impressions_in: f64,
     pub impressions_oon: f64,
     pub impressions_total: f64,
@@ -199,6 +249,7 @@ pub struct SimulationOutput {
     pub unique_engagement_rate: f64,
     pub action_volume_rate: f64,
     pub actions: ActionProbs,
+    pub phoenix_actions: Option<ActionProbs>,
     pub signals: Signals,
     pub suggestions: Vec<String>,
     pub llm: Option<LlmScore>,
@@ -301,14 +352,40 @@ pub fn extract_text_features(text: &str) -> TextFeatures {
     }
 }
 
+fn load_scoring_config() -> ScoringConfig {
+    ScoringConfig::load(None)
+        .map(|(config, _)| config)
+        .unwrap_or_default()
+}
+
 pub fn simulate(input: &SimulatorInput) -> SimulationOutput {
-    simulate_with_llm(input, None, None)
+    let config = load_scoring_config();
+    simulate_with_mode(input, None, None, ScoringMode::Heuristic, None, &config)
 }
 
 pub fn simulate_with_llm(
     input: &SimulatorInput,
     llm: Option<&LlmScore>,
     llm_trace: Option<&LlmTrace>,
+) -> SimulationOutput {
+    let config = load_scoring_config();
+    simulate_with_mode(
+        input,
+        llm,
+        llm_trace,
+        ScoringMode::Heuristic,
+        None,
+        &config,
+    )
+}
+
+pub fn simulate_with_mode(
+    input: &SimulatorInput,
+    llm: Option<&LlmScore>,
+    llm_trace: Option<&LlmTrace>,
+    scoring_mode: ScoringMode,
+    phoenix_actions: Option<&ActionProbs>,
+    scoring_config: &ScoringConfig,
 ) -> SimulationOutput {
     let features = extract_text_features(&input.text);
     let media_score = input.media.media_score();
@@ -422,25 +499,90 @@ pub fn simulate_with_llm(
     let is_video = input.media.is_video();
     let is_image = input.media.is_image();
 
-    let actions = ActionProbs {
-        like: sigmoid(base + 0.6 * media_score + 0.2 * sentiment.max(0.0)),
-        reply: sigmoid(base - 0.2 * media_score + 0.6 * has_question + 0.3 * controversy + 0.2 * cta_reply),
-        repost: sigmoid(base + 0.6 * shareability + 0.3 * novelty - 0.3 * link_flag + 0.1 * cta_share),
-        quote: sigmoid(base + 0.4 * controversy + 0.2 * novelty),
-        click: sigmoid(base + 0.9 * link_flag + 0.2 * hook),
-        profile_click: sigmoid(base + 0.5 * author_quality + 0.2 * novelty),
-        video_view: sigmoid(base + 1.2 * is_video + 0.2 * hook),
-        photo_expand: sigmoid(base + 1.0 * is_image + 0.1 * hook),
-        share: sigmoid(base + 0.5 * shareability + 0.2 * novelty),
-        dwell: sigmoid(base + 0.2 * length_score + 0.4 * media_score - 0.2 * link_flag),
-        follow_author: sigmoid(base + 0.6 * author_quality + 0.2 * hook),
-        not_interested: sigmoid(-1.0 + 2.2 * negative_risk + 0.6 * topic_saturation - 0.8 * audience_alignment),
-        block: sigmoid(-2.0 + 2.6 * negative_risk + 0.6 * controversy),
-        mute: sigmoid(-1.8 + 2.3 * negative_risk + 0.8 * topic_saturation),
-        report: sigmoid(-2.4 + 2.8 * negative_risk + 0.6 * controversy),
+    let like = sigmoid(base + 0.6 * media_score + 0.2 * sentiment.max(0.0));
+    let reply = sigmoid(
+        base - 0.2 * media_score + 0.6 * has_question + 0.3 * controversy + 0.2 * cta_reply,
+    );
+    let repost =
+        sigmoid(base + 0.6 * shareability + 0.3 * novelty - 0.3 * link_flag + 0.1 * cta_share);
+    let quote = sigmoid(base + 0.4 * controversy + 0.2 * novelty);
+    let click = sigmoid(base + 0.9 * link_flag + 0.2 * hook);
+    let profile_click = sigmoid(base + 0.5 * author_quality + 0.2 * novelty);
+    let video_view = sigmoid(base + 1.2 * is_video + 0.2 * hook);
+    let photo_expand = sigmoid(base + 1.0 * is_image + 0.1 * hook);
+    let share = sigmoid(base + 0.5 * shareability + 0.2 * novelty);
+    let share_dm = sigmoid(base + 0.35 * shareability + 0.1 * novelty - 0.1 * link_flag);
+    let share_link = sigmoid(base + 0.25 * shareability + 0.2 * link_flag);
+    let dwell = sigmoid(base + 0.2 * length_score + 0.4 * media_score - 0.2 * link_flag);
+    let follow_author = sigmoid(base + 0.6 * author_quality + 0.2 * hook);
+    let quoted_click = sigmoid(base + 0.4 * controversy + 0.2 * hook + 0.1 * novelty);
+    let not_interested = sigmoid(
+        -1.0 + 2.2 * negative_risk + 0.6 * topic_saturation - 0.8 * audience_alignment,
+    );
+    let block = sigmoid(-2.0 + 2.6 * negative_risk + 0.6 * controversy);
+    let mute = sigmoid(-1.8 + 2.3 * negative_risk + 0.8 * topic_saturation);
+    let report = sigmoid(-2.4 + 2.8 * negative_risk + 0.6 * controversy);
+    let dwell_time = estimate_dwell_time(features.char_count, media_score, dwell);
+
+    let heuristic_actions = ActionProbs {
+        like,
+        reply,
+        repost,
+        quote,
+        click,
+        profile_click,
+        video_view,
+        photo_expand,
+        share,
+        share_dm,
+        share_link,
+        dwell,
+        follow_author,
+        quoted_click,
+        not_interested,
+        block,
+        mute,
+        report,
+        dwell_time,
     };
 
-    let weighted_score = weighted_score(&actions);
+    let actions = match scoring_mode {
+        ScoringMode::Heuristic => heuristic_actions.clone(),
+        ScoringMode::Phoenix => phoenix_actions
+            .cloned()
+            .unwrap_or_else(|| heuristic_actions.clone()),
+        ScoringMode::Hybrid { phoenix_weight } => {
+            if let Some(phoenix_actions) = phoenix_actions {
+                blend_actions(&heuristic_actions, phoenix_actions, phoenix_weight)
+            } else {
+                heuristic_actions.clone()
+            }
+        }
+    };
+
+    let pipeline = build_pipeline(scoring_config);
+    let mut candidates = vec![ScoredCandidate::new(
+        derive_post_id(input),
+        derive_author_id(input),
+        input.is_oon,
+        derive_video_duration(input),
+        actions.clone(),
+    )];
+    pipeline.score(&mut candidates);
+    let candidate = candidates.pop().unwrap_or_else(|| {
+        ScoredCandidate::new(
+            "post".to_string(),
+            "author".to_string(),
+            false,
+            None,
+            actions.clone(),
+        )
+    });
+
+    let weighted_score = candidate.weighted_score;
+    let diversity_multiplier = candidate.diversity_multiplier;
+    let oon_multiplier = candidate.oon_multiplier;
+    let final_score = candidate.score;
 
     let time_score = time_of_day_score(input.hour_of_day);
     let active_fraction = 0.015 + 0.08 * time_score;
@@ -450,9 +592,9 @@ pub fn simulate_with_llm(
         .max(0.0);
 
     let oon_seed = 300.0 + 1400.0 * positive_signal;
-    let oon_multiplier = 1.0 + clamp01((weighted_score - 1.0) / 3.0) * 4.0;
+    let oon_reach_multiplier = 1.0 + clamp01((weighted_score - 1.0) / 3.0) * 4.0;
     let mut impressions_oon = oon_seed
-        * oon_multiplier
+        * oon_reach_multiplier
         * (0.5 + 0.5 * content_quality)
         * (1.0 - 0.7 * topic_saturation)
         * (1.0 - 0.5 * negative_risk);
@@ -468,7 +610,7 @@ pub fn simulate_with_llm(
     let expected_action_volume = impressions_total * action_volume_rate;
     let expected_unique_engagements = impressions_total * unique_engagement_rate;
 
-    let raw = (weighted_score - 1.0) * 0.8 + (log10_safe(impressions_total + 1.0) - 3.0) * 0.4;
+    let raw = (final_score - 1.0) * 0.8 + (log10_safe(impressions_total + 1.0) - 3.0) * 0.4;
     let score = 100.0 * sigmoid(raw);
     let tier = tier_from_score(score);
 
@@ -495,7 +637,11 @@ pub fn simulate_with_llm(
     SimulationOutput {
         score,
         tier,
+        scoring_mode,
         weighted_score,
+        diversity_multiplier,
+        oon_multiplier,
+        final_score,
         impressions_in,
         impressions_oon,
         impressions_total,
@@ -504,11 +650,97 @@ pub fn simulate_with_llm(
         unique_engagement_rate,
         action_volume_rate,
         actions,
+        phoenix_actions: phoenix_actions.cloned(),
         signals,
         suggestions,
         llm: llm.cloned(),
         llm_trace: llm_trace.cloned(),
     }
+}
+
+fn build_pipeline(config: &ScoringConfig) -> ScoringPipeline {
+    let weighted = WeightedScorer::new(
+        config.weights.clone(),
+        config.weighted.vqv_duration_threshold,
+        config.weighted.score_offset,
+    );
+    let diversity = AuthorDiversityScorer::new(config.diversity.clone());
+    let oon = OonScorer::new(config.oon.clone());
+    ScoringPipeline::new(weighted, diversity, oon)
+}
+
+fn derive_post_id(input: &SimulatorInput) -> String {
+    input.post_id.clone().unwrap_or_else(|| {
+        let hash = stable_hash64(&input.text);
+        format!("post_{:x}", hash)
+    })
+}
+
+fn derive_author_id(input: &SimulatorInput) -> String {
+    input.author_id.clone().unwrap_or_else(|| {
+        let payload = format!(
+            "{}:{}:{}:{}",
+            input.followers, input.following, input.account_age_days, input.verified
+        );
+        let hash = stable_hash64(&payload);
+        format!("author_{:x}", hash)
+    })
+}
+
+fn derive_video_duration(input: &SimulatorInput) -> Option<f64> {
+    if let Some(duration) = input.video_duration_seconds {
+        return Some(duration.max(0.0));
+    }
+    if matches!(input.media, MediaType::Video) {
+        return Some(15.0);
+    }
+    None
+}
+
+fn estimate_dwell_time(char_count: usize, media_score: f64, dwell_prob: f64) -> f64 {
+    let base = 1.5 + (char_count as f64 / 80.0);
+    let media_lift = 6.0 * media_score;
+    let dwell_lift = 10.0 * dwell_prob;
+    let estimate = base + media_lift + dwell_lift;
+    estimate.max(0.0).min(60.0)
+}
+
+fn blend_actions(base: &ActionProbs, overlay: &ActionProbs, weight: f64) -> ActionProbs {
+    let blend_prob = |a: f64, b: f64| clamp01(a * (1.0 - weight) + b * weight);
+    let blend_value = |a: f64, b: f64| a * (1.0 - weight) + b * weight;
+
+    ActionProbs {
+        like: blend_prob(base.like, overlay.like),
+        reply: blend_prob(base.reply, overlay.reply),
+        repost: blend_prob(base.repost, overlay.repost),
+        quote: blend_prob(base.quote, overlay.quote),
+        click: blend_prob(base.click, overlay.click),
+        profile_click: blend_prob(base.profile_click, overlay.profile_click),
+        video_view: blend_prob(base.video_view, overlay.video_view),
+        photo_expand: blend_prob(base.photo_expand, overlay.photo_expand),
+        share: blend_prob(base.share, overlay.share),
+        share_dm: blend_prob(base.share_dm, overlay.share_dm),
+        share_link: blend_prob(base.share_link, overlay.share_link),
+        dwell: blend_prob(base.dwell, overlay.dwell),
+        follow_author: blend_prob(base.follow_author, overlay.follow_author),
+        quoted_click: blend_prob(base.quoted_click, overlay.quoted_click),
+        not_interested: blend_prob(base.not_interested, overlay.not_interested),
+        block: blend_prob(base.block, overlay.block),
+        mute: blend_prob(base.mute, overlay.mute),
+        report: blend_prob(base.report, overlay.report),
+        dwell_time: blend_value(base.dwell_time, overlay.dwell_time),
+    }
+}
+
+fn stable_hash64(value: &str) -> u64 {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(value.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&digest[..8]);
+    u64::from_be_bytes(bytes)
 }
 
 fn build_suggestions(
@@ -598,41 +830,22 @@ fn unique_engagement_rate(actions: &ActionProbs) -> f64 {
     clamp01(1.0 - none_probability)
 }
 
-fn positive_action_probs(actions: &ActionProbs) -> [f64; 10] {
-    [
+fn positive_action_probs(actions: &ActionProbs) -> Vec<f64> {
+    vec![
         actions.like,
         actions.reply,
         actions.repost,
         actions.quote,
         actions.share,
+        actions.share_dm,
+        actions.share_link,
         actions.click,
         actions.profile_click,
         actions.follow_author,
         actions.video_view,
         actions.photo_expand,
+        actions.quoted_click,
     ]
-}
-
-fn weighted_score(actions: &ActionProbs) -> f64 {
-    let weights = [
-        (actions.like, 1.0),
-        (actions.reply, 1.6),
-        (actions.repost, 2.0),
-        (actions.quote, 1.7),
-        (actions.click, 0.4),
-        (actions.profile_click, 0.3),
-        (actions.video_view, 0.5),
-        (actions.photo_expand, 0.3),
-        (actions.share, 1.4),
-        (actions.dwell, 0.2),
-        (actions.follow_author, 1.2),
-        (actions.not_interested, -2.5),
-        (actions.block, -5.0),
-        (actions.mute, -3.0),
-        (actions.report, -6.0),
-    ];
-
-    weights.iter().map(|(p, w)| p * w).sum()
 }
 
 fn tier_from_score(score: f64) -> ViralityTier {

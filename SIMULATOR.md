@@ -8,14 +8,16 @@ This simulator is a modeling sandbox for the X "For You" ranking system. It turn
 | --- | --- | --- | --- |
 | Pipeline stages (hydrate -> source -> score -> filter -> select) | `README.md`, `home-mixer/`, `candidate-pipeline/` | Mirrors the stage order as a conceptual flow | Conceptual only |
 | Engagement action types (like, reply, repost, click, share, etc.) | `home-mixer/scorers/weighted_scorer.rs`, `phoenix/` | Uses the same action taxonomy in `ActionProbs` | Implemented |
-| Weighted scoring over actions | `home-mixer/scorers/weighted_scorer.rs` | Uses a weighted sum in `simulator/src/lib.rs` | Partial (weights are heuristic) |
-| OON vs in-network handling | `home-mixer/scorers/oon_scorer.rs` | Applies a simplified multiplier + impressions split | Approximation |
-| Author diversity | `home-mixer/scorers/author_diversity_scorer.rs` | Uses a simplified penalty (not full per-feed sequencing) | Approximation |
-| Phoenix prediction model | `phoenix/` | Not executed; we simulate probabilities | Simulated |
+| Weighted scoring over actions | `home-mixer/scorers/weighted_scorer.rs` | Weighted scorer + config in `simulator/src/scoring/` | Implemented (configurable) |
+| OON vs in-network handling | `home-mixer/scorers/oon_scorer.rs` | OON multiplier in scoring pipeline + impressions split | Approximation |
+| Author diversity | `home-mixer/scorers/author_diversity_scorer.rs` | Exponential decay scorer in pipeline | Approximation |
+| Phoenix prediction model | `phoenix/` | Optional Phoenix JAX service (`phoenix/service/`) | Implemented (optional) |
 | Candidate retrieval (Thunder + Phoenix Retrieval) | `thunder/`, `phoenix/` | Not executed; we estimate aggregate reach | Simulated |
 | Filters/hydrators | `home-mixer/filters/`, `home-mixer/candidate_hydrators/` | Not executed | Omitted |
+| User history | `simulator/src/user/` | Stored profiles + synthetic history for Phoenix | Optional |
+| Calibration | `simulator/src/calibration/` | Metrics + weight tuning via CLI | Implemented |
 
-Important: The open-source release does not include `home-mixer/params` or `home-mixer/clients` (see `home-mixer/lib.rs`). Those missing parameters and production clients are why the simulator cannot use real weights or a real prediction backend.
+Important: The open-source release does not include `home-mixer/params` or `home-mixer/clients` (see `home-mixer/lib.rs`). Those missing parameters and production clients are why the simulator cannot use real weights or production embeddings.
 
 Also important: Grok analysis is not part of the For You algorithm. It is an optional, local assist that scores text-level signals (hook, clarity, shareability) and feeds those into the simulator.
 
@@ -28,16 +30,21 @@ CLI (cargo run -- simulate)        Web UI (Vite + React)
            |                      HTTP + SSE /api/simulate
            v                                  |
     simulator/src/lib.rs <---------------- simulator/src/server.rs
-           |
-   Heuristic + optional Grok
+           |                                  |
+   Heuristic + optional Grok                   |
+           |                                  |
+   Optional Phoenix service  <----------------+
            |
     SimulationOutput (score, impressions, actions, suggestions)
 ```
 
 Key modules:
-- `simulator/src/lib.rs`: core heuristics, signal blending, action rates, weighted score.
+- `simulator/src/lib.rs`: core heuristics, signal blending, scoring pipeline.
 - `simulator/src/llm.rs`: Grok scoring (optional) + SSE token streaming.
 - `simulator/src/server.rs`: API + SSE + snapshot storage.
+- `simulator/src/scoring/`: weighted + diversity + OON scorers.
+- `simulator/src/user/`: user profiles + synthetic history.
+- `phoenix/service/`: FastAPI wrapper for Phoenix JAX model.
 - `webapp/`: UI, SSE feed, snapshot compare, transcript panel.
 
 ## How it leverages the open-source algorithm
@@ -49,7 +56,7 @@ The simulator follows the public algorithm shape and vocabulary:
 - **Ranking intent**: output is a single ranked score plus action-level breakdown, similar to `Phoenix` outputs.
 
 What it does not do:
-- It does not run the Phoenix model (`phoenix/` is a JAX example, not wired into this simulator).
+- It can run the Phoenix model via the optional service, but it uses synthetic embeddings and weights.
 - It does not ingest or hydrate real candidates.
 - It does not use missing production weights (params are excluded).
 
@@ -72,7 +79,7 @@ What it is not good for:
 
 ## Limitations
 
-- No real user graph, history, or personalized embeddings.
+- No real user graph or production embeddings.
 - No real candidate retrieval or filtering (duplicates, blocks, muted keywords).
 - Heuristic weights are not from production params.
 - LLM scoring is subjective and model-dependent.
@@ -81,19 +88,16 @@ What it is not good for:
 ## Ideas for improvement
 
 Short-term:
-- Port the public weights structure from `WeightedScorer` and allow a tunable config file.
-- Simulate candidate sets and apply `AuthorDiversityScorer` more faithfully.
-- Calibrate action-rate distributions against a small labeled dataset.
+- Add real data sources (X API, opt-in exports) for calibration.
+- Expand filter/hydration approximations.
 
 Medium-term:
-- Wire the Phoenix JAX model into a service and use it to score candidates.
-- Add a synthetic user history generator to mimic the retrieval and ranking inputs.
-- Implement a fuller filter/hydration pass (muted keywords, recency, repeats).
+- Replace synthetic embeddings with real embedding tables.
+- Tune weights with larger calibration sets.
 
 Long-term:
-- Integrate a real data source (X API, opt-in analytics exports) for calibration.
-- Add feedback loops and fit weights against observed engagements.
-- Build benchmarking suites for known tweets and expected relative ranking.
+- Integrate a real candidate retrieval pipeline.
+- Build benchmarking suites for known tweets and expected ranking deltas.
 
 ## Running the simulator
 
@@ -108,11 +112,24 @@ cargo run -- serve --port 8787
 ```
 Then open `http://localhost:8787`.
 
+Phoenix service (optional):
+```
+cd phoenix
+uvicorn service.server:app --reload --port 8000
+```
+
 Environment variables:
 - `XAI_API_KEY`: enable Grok scoring.
 - `XAI_MODEL`: override model name (default `grok-2-latest`).
 - `XAI_API_BASE`: override API base URL.
 - `SIM_SNAPSHOT_PATH`: snapshot storage file path (default `data/snapshots.json`).
+- `PHOENIX_ENDPOINT`: Phoenix service URL (default `http://localhost:8000`).
+- `PHOENIX_TIMEOUT_MS`: Phoenix request timeout (ms).
+- `SCORING_MODE`: `heuristic`, `phoenix`, or `hybrid`.
+- `PHOENIX_WEIGHT`: blend weight for hybrid mode.
+- `SCORING_CONFIG_PATH`: config file path (default `config/scoring.toml`).
+- `USER_PROFILES_PATH`: user profile storage path.
+- `CALIBRATION_DATA_PATH`: default calibration dataset path.
 
 ## Streaming notes
 

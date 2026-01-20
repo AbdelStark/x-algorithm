@@ -1,0 +1,27 @@
+name: e2e
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run simulator tests
+        working-directory: simulator
+        run: cargo test -q
+
+      - name: Run e2e script
+        run: bash scripts/e2e.sh

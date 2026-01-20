@@ -16,12 +16,16 @@ type ActionProbs = {
   videoView: number;
   photoExpand: number;
   share: number;
+  shareDm: number;
+  shareLink: number;
   dwell: number;
   followAuthor: number;
+  quotedClick: number;
   notInterested: number;
   block: number;
   mute: number;
   report: number;
+  dwellTime: number;
 };
 
 type Signals = {
@@ -63,7 +67,11 @@ type LlmTrace = {
 type SimulationResult = {
   score: number;
   tier: string;
+  scoringMode: string;
   weightedScore: number;
+  diversityMultiplier: number;
+  oonMultiplier: number;
+  finalScore: number;
   impressionsIn: number;
   impressionsOon: number;
   impressionsTotal: number;
@@ -72,6 +80,7 @@ type SimulationResult = {
   uniqueEngagementRate: number;
   actionVolumeRate: number;
   actions: ActionProbs;
+  phoenixActions?: ActionProbs;
   signals: Signals;
   suggestions: string[];
   warnings: string[];
@@ -140,6 +149,9 @@ type FormState = {
   controversy: number;
   sentiment: number;
   useAi: boolean;
+  scoringMode: "heuristic" | "phoenix" | "hybrid";
+  phoenixWeight: number;
+  userId: string;
 };
 
 const DEFAULT_FORM: FormState = {
@@ -160,6 +172,9 @@ const DEFAULT_FORM: FormState = {
   controversy: 0.3,
   sentiment: 0.1,
   useAi: false,
+  scoringMode: "hybrid",
+  phoenixWeight: 0.7,
+  userId: "",
 };
 
 const INITIAL_ACTIVITY: ActivityStep[] = [
@@ -188,6 +203,8 @@ function App() {
   const [xStatus, setXStatus] = useState<"idle" | "loading" | "connected" | "error">("idle");
   const [xStatusMessage, setXStatusMessage] = useState<string | null>(null);
   const [xOauth, setXOauth] = useState<XOAuthStatus | null>(null);
+  const [userStatus, setUserStatus] = useState<string | null>(null);
+  const [userSaving, setUserSaving] = useState(false);
   const eventSourceRef = useRef<EventSource | null>(null);
   const autoFetchRef = useRef(false);
   const oauthReturnHandled = useRef(false);
@@ -349,7 +366,10 @@ function App() {
       return;
     }
 
-    if (!form.useAi) {
+    const needsServer =
+      form.useAi || form.scoringMode !== "heuristic" || form.userId.trim() !== "";
+
+    if (!needsServer) {
       closeStream();
       setLoading(false);
       setProgressMessage(null);
@@ -362,15 +382,23 @@ function App() {
 
     const requestId = generateRequestId();
     setLoading(true);
-    setProgressMessage("Preparing Grok...");
-    setActivity([
-      { label: "Preparing prompt", status: "active" },
-      { label: "Calling Grok API", status: "pending" },
-      { label: "Streaming response", status: "pending" },
-      { label: "Merging signals", status: "pending" },
-    ]);
+    setProgressMessage(form.useAi ? "Preparing Grok..." : "Running simulation...");
+    setActivity(
+      form.useAi
+        ? [
+            { label: "Preparing prompt", status: "active" },
+            { label: "Calling Grok API", status: "pending" },
+            { label: "Streaming response", status: "pending" },
+            { label: "Merging signals", status: "pending" },
+          ]
+        : INITIAL_ACTIVITY
+    );
     appendLog("start", `Simulation ${requestId} started`);
-    startStreaming(requestId);
+    if (form.useAi) {
+      startStreaming(requestId);
+    } else {
+      closeStream();
+    }
 
     try {
       const response = await fetch("/api/simulate", {
@@ -394,19 +422,26 @@ function App() {
           audience_fit: form.audienceFit,
           controversy: form.controversy,
           sentiment: form.sentiment,
-          use_ai: true,
+          use_ai: form.useAi,
+          scoring_mode: form.scoringMode,
+          phoenix_weight: form.phoenixWeight,
+          user_id: form.userId.trim() || undefined,
         }),
       });
 
       if (!response.ok) {
-        setAlerts([`AI server error: ${response.status}`]);
+        setAlerts([`Server error: ${response.status}`]);
         setResult(simulateLocal(form));
-        setActivity([
-          { label: "Preparing prompt", status: "done" },
-          { label: "Calling Grok API", status: "error" },
-          { label: "Streaming response", status: "pending" },
-          { label: "Merging signals", status: "pending" },
-        ]);
+        setActivity(
+          form.useAi
+            ? [
+                { label: "Preparing prompt", status: "done" },
+                { label: "Calling Grok API", status: "error" },
+                { label: "Streaming response", status: "pending" },
+                { label: "Merging signals", status: "pending" },
+              ]
+            : INITIAL_ACTIVITY
+        );
         setLoading(false);
         setProgressMessage(null);
         closeStream();
@@ -536,6 +571,43 @@ function App() {
   };
 
   const clearLogs = () => setLogs([]);
+
+  async function saveUserProfile(generateSynthetic: boolean) {
+    const userId = form.userId.trim();
+    if (!userId) {
+      setAlerts(["Add a user ID to save a profile."]);
+      return;
+    }
+    setUserSaving(true);
+    setUserStatus(null);
+    try {
+      const response = await fetch("/api/users", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          user_id: userId,
+          followers: form.followers,
+          following: form.following,
+          account_age_days: form.accountAgeDays,
+          verified: form.verified,
+          generate_synthetic_history: generateSynthetic,
+        }),
+      });
+      if (!response.ok) {
+        setUserStatus(`Profile save failed (${response.status}).`);
+        return;
+      }
+      setUserStatus(
+        generateSynthetic
+          ? "Profile saved with synthetic history."
+          : "Profile saved."
+      );
+    } catch {
+      setUserStatus("Profile save failed.");
+    } finally {
+      setUserSaving(false);
+    }
+  }
 
   async function createSnapshot(): Promise<Snapshot | null> {
     try {
@@ -685,6 +757,7 @@ function App() {
       following: profile.following,
       accountAgeDays: ageDays ?? prev.accountAgeDays,
       verified: profile.verified ?? prev.verified,
+      userId: profile.id || prev.userId,
     }));
   }
 
@@ -815,13 +888,91 @@ function App() {
           </div>
 
           <div className={`mode-banner ${form.useAi ? "ai" : "local"}`}>
-            <span className="mode-pill">{form.useAi ? "Grok mode" : "Local mode"}</span>
+            <span className="mode-pill">
+              {form.useAi
+                ? "Grok mode"
+                : form.scoringMode === "heuristic"
+                  ? "Local mode"
+                  : "Phoenix mode"}
+            </span>
             <p>
               {form.useAi
                 ? "Grok scores hook, clarity, novelty, and shareability before we merge signals."
-                : "Runs the local heuristic model with no external calls."}
+                : form.scoringMode === "heuristic"
+                  ? "Runs the local heuristic model with no external calls."
+                  : "Scores candidates with the Phoenix model service and production-style weights."}
             </p>
           </div>
+
+          <div className="section-label" id="scoring-mode-label">Scoring mode</div>
+          <div className="grid two" role="group" aria-labelledby="scoring-mode-label">
+            <Field label="Scoring mode">
+              <select
+                value={form.scoringMode}
+                onChange={(event) =>
+                  setForm({
+                    ...form,
+                    scoringMode: event.target.value as FormState["scoringMode"],
+                  })
+                }
+              >
+                <option value="heuristic">Heuristic</option>
+                <option value="hybrid">Hybrid (Phoenix + heuristic)</option>
+                <option value="phoenix">Phoenix only</option>
+              </select>
+            </Field>
+            <Field label="Phoenix weight">
+              <input
+                type="number"
+                step="0.05"
+                min={0}
+                max={1}
+                value={form.phoenixWeight}
+                onChange={(event) =>
+                  setForm({
+                    ...form,
+                    phoenixWeight: Math.max(0, Math.min(1, Number(event.target.value))),
+                  })
+                }
+                disabled={form.scoringMode !== "hybrid"}
+              />
+            </Field>
+          </div>
+
+          <div className="section-label" id="user-context-label">Simulate as user</div>
+          <div className="grid two" role="group" aria-labelledby="user-context-label">
+            <Field label="User ID">
+              <input
+                type="text"
+                value={form.userId}
+                onChange={(event) =>
+                  setForm({ ...form, userId: event.target.value })
+                }
+                placeholder="user_123"
+              />
+            </Field>
+            <Field label="Profile actions">
+              <div className="inline-actions">
+                <button
+                  className="ghost"
+                  type="button"
+                  onClick={() => saveUserProfile(false)}
+                  disabled={userSaving}
+                >
+                  Save profile
+                </button>
+                <button
+                  className="ghost"
+                  type="button"
+                  onClick={() => saveUserProfile(true)}
+                  disabled={userSaving}
+                >
+                  Generate history
+                </button>
+              </div>
+            </Field>
+          </div>
+          {userStatus && <div className="hint user-status">{userStatus}</div>}
 
           <div className="compose">
             <label htmlFor="tweet-text" className="sr-only">
@@ -1033,6 +1184,14 @@ function App() {
             <div className="score-meta">
               <span>Weighted score</span>
               <strong>{loading ? "—" : formatFloat(result.weightedScore, 2)}</strong>
+              <span>Final score</span>
+              <strong>{loading ? "—" : formatFloat(result.finalScore, 2)}</strong>
+              <span>Scoring mode</span>
+              <strong>{loading ? "—" : result.scoringMode}</strong>
+              <span>Diversity multiplier</span>
+              <strong>{loading ? "—" : formatFloat(result.diversityMultiplier, 2)}</strong>
+              <span>OON multiplier</span>
+              <strong>{loading ? "—" : formatFloat(result.oonMultiplier, 2)}</strong>
               <span>Total impressions</span>
               <strong>{loading ? "—" : formatNumber(result.impressionsTotal)}</strong>
               <span>In-network</span>
@@ -1254,11 +1413,27 @@ function App() {
               {Object.entries(result.actions).map(([key, value]) => (
                 <div key={key}>
                   <span>{formatLabel(key)}</span>
-                  <strong>{formatPercent(value)}</strong>
+                  <strong>{formatActionValue(key, value)}</strong>
                 </div>
               ))}
             </div>
           </div>
+
+          {result.phoenixActions && (
+            <div className="hood-card">
+              <div className="card-header">
+                <h4>Phoenix actions</h4>
+              </div>
+              <div className="prob-grid">
+                {Object.entries(result.phoenixActions).map(([key, value]) => (
+                  <div key={key}>
+                    <span>{formatLabel(key)}</span>
+                    <strong>{formatActionValue(key, value)}</strong>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
 
           <div className="hood-card" role="region" aria-label="Saved snapshots">
             <div className="card-header">
@@ -1587,10 +1762,18 @@ function normalizeApiResponse(raw: any): SimulationResult {
   const actionsRaw = raw.actions || {};
   const signalsRaw = raw.signals || {};
 
+  const rawMode = raw.scoringMode ?? raw.scoring_mode ?? DEFAULT_FORM.scoringMode;
+  const scoringMode =
+    rawMode === "phoenix" || rawMode === "hybrid" ? rawMode : "heuristic";
+
   return {
     score: raw.score ?? 0,
     tier: raw.tier ?? "Low",
+    scoringMode: raw.scoring_mode ?? raw.scoringMode ?? "heuristic",
     weightedScore: raw.weighted_score ?? 0,
+    diversityMultiplier: raw.diversity_multiplier ?? 1,
+    oonMultiplier: raw.oon_multiplier ?? 1,
+    finalScore: raw.final_score ?? raw.weighted_score ?? 0,
     impressionsIn: raw.impressions_in ?? 0,
     impressionsOon: raw.impressions_oon ?? 0,
     impressionsTotal: raw.impressions_total ?? 0,
@@ -1608,13 +1791,40 @@ function normalizeApiResponse(raw: any): SimulationResult {
       videoView: actionsRaw.video_view ?? 0,
       photoExpand: actionsRaw.photo_expand ?? 0,
       share: actionsRaw.share ?? 0,
+      shareDm: actionsRaw.share_dm ?? 0,
+      shareLink: actionsRaw.share_link ?? 0,
       dwell: actionsRaw.dwell ?? 0,
       followAuthor: actionsRaw.follow_author ?? 0,
+      quotedClick: actionsRaw.quoted_click ?? 0,
       notInterested: actionsRaw.not_interested ?? 0,
       block: actionsRaw.block ?? 0,
       mute: actionsRaw.mute ?? 0,
       report: actionsRaw.report ?? 0,
+      dwellTime: actionsRaw.dwell_time ?? 0,
     },
+    phoenixActions: raw.phoenix_actions
+      ? {
+          like: raw.phoenix_actions.like ?? 0,
+          reply: raw.phoenix_actions.reply ?? 0,
+          repost: raw.phoenix_actions.repost ?? 0,
+          quote: raw.phoenix_actions.quote ?? 0,
+          click: raw.phoenix_actions.click ?? 0,
+          profileClick: raw.phoenix_actions.profile_click ?? 0,
+          videoView: raw.phoenix_actions.video_view ?? 0,
+          photoExpand: raw.phoenix_actions.photo_expand ?? 0,
+          share: raw.phoenix_actions.share ?? 0,
+          shareDm: raw.phoenix_actions.share_dm ?? 0,
+          shareLink: raw.phoenix_actions.share_link ?? 0,
+          dwell: raw.phoenix_actions.dwell ?? 0,
+          followAuthor: raw.phoenix_actions.follow_author ?? 0,
+          quotedClick: raw.phoenix_actions.quoted_click ?? 0,
+          notInterested: raw.phoenix_actions.not_interested ?? 0,
+          block: raw.phoenix_actions.block ?? 0,
+          mute: raw.phoenix_actions.mute ?? 0,
+          report: raw.phoenix_actions.report ?? 0,
+          dwellTime: raw.phoenix_actions.dwell_time ?? 0,
+        }
+      : undefined,
     signals: {
       contentQuality: signalsRaw.content_quality ?? 0,
       hook: signalsRaw.hook ?? 0,
@@ -1700,12 +1910,15 @@ function normalizeSnapshotInput(raw: any): FormState {
     controversy: Number(raw.controversy ?? DEFAULT_FORM.controversy),
     sentiment: Number(raw.sentiment ?? DEFAULT_FORM.sentiment),
     useAi: Boolean(raw.useAi ?? raw.use_ai ?? DEFAULT_FORM.useAi),
+    scoringMode,
+    phoenixWeight: Number(raw.phoenixWeight ?? raw.phoenix_weight ?? DEFAULT_FORM.phoenixWeight),
+    userId: String(raw.userId ?? raw.user_id ?? DEFAULT_FORM.userId ?? ""),
   };
 }
 
 function normalizeSnapshotOutput(raw: any): SimulationResult {
   if (!raw || typeof raw !== "object") return simulateLocal(DEFAULT_FORM);
-  if ("weightedScore" in raw && "score" in raw) {
+  if ("weightedScore" in raw && "score" in raw && "finalScore" in raw) {
     return raw as SimulationResult;
   }
   return normalizeApiResponse(raw);
@@ -1783,6 +1996,24 @@ function buildCompareRows(left: Snapshot, right: Snapshot): CompareRow[] {
       label: "Weighted score",
       left: leftOutput.weightedScore,
       right: rightOutput.weightedScore,
+      format: (value) => value.toFixed(2),
+    },
+    {
+      label: "Final score",
+      left: leftOutput.finalScore,
+      right: rightOutput.finalScore,
+      format: (value) => value.toFixed(2),
+    },
+    {
+      label: "Diversity multiplier",
+      left: leftOutput.diversityMultiplier,
+      right: rightOutput.diversityMultiplier,
+      format: (value) => value.toFixed(2),
+    },
+    {
+      label: "OON multiplier",
+      left: leftOutput.oonMultiplier,
+      right: rightOutput.oonMultiplier,
       format: (value) => value.toFixed(2),
     },
     {
@@ -1932,25 +2163,52 @@ function simulateLocal(form: FormState): SimulationResult {
   const isVideo = form.media === "video" ? 1 : 0;
   const isImage = form.media === "image" || form.media === "gif" ? 1 : 0;
 
+  const like = sigmoid(base + 0.6 * mediaScore + 0.2 * Math.max(0, form.sentiment));
+  const reply = sigmoid(base - 0.2 * mediaScore + 0.6 * hasQuestion + 0.3 * form.controversy + 0.2 * ctaReply);
+  const repost = sigmoid(base + 0.6 * shareability + 0.3 * novelty - 0.3 * linkFlag + 0.1 * ctaShare);
+  const quote = sigmoid(base + 0.4 * form.controversy + 0.2 * novelty);
+  const click = sigmoid(base + 0.9 * linkFlag + 0.2 * hook);
+  const profileClick = sigmoid(base + 0.5 * authorQuality + 0.2 * novelty);
+  const videoView = sigmoid(base + 1.2 * isVideo + 0.2 * hook);
+  const photoExpand = sigmoid(base + 1.0 * isImage + 0.1 * hook);
+  const share = sigmoid(base + 0.5 * shareability + 0.2 * novelty);
+  const shareDm = sigmoid(base + 0.35 * shareability + 0.1 * novelty - 0.1 * linkFlag);
+  const shareLink = sigmoid(base + 0.25 * shareability + 0.2 * linkFlag);
+  const dwell = sigmoid(base + 0.2 * lengthScore + 0.4 * mediaScore - 0.2 * linkFlag);
+  const followAuthor = sigmoid(base + 0.6 * authorQuality + 0.2 * hook);
+  const quotedClick = sigmoid(base + 0.4 * form.controversy + 0.2 * hook + 0.1 * novelty);
+  const notInterested = sigmoid(-1.0 + 2.2 * negativeRisk + 0.6 * topicSaturation - 0.8 * audienceAlignment);
+  const block = sigmoid(-2.0 + 2.6 * negativeRisk + 0.6 * form.controversy);
+  const mute = sigmoid(-1.8 + 2.3 * negativeRisk + 0.8 * topicSaturation);
+  const report = sigmoid(-2.4 + 2.8 * negativeRisk + 0.6 * form.controversy);
+  const dwellTime = estimateDwellTime(features.charCount, mediaScore, dwell);
+
   const actions: ActionProbs = {
-    like: sigmoid(base + 0.6 * mediaScore + 0.2 * Math.max(0, form.sentiment)),
-    reply: sigmoid(base - 0.2 * mediaScore + 0.6 * hasQuestion + 0.3 * form.controversy + 0.2 * ctaReply),
-    repost: sigmoid(base + 0.6 * shareability + 0.3 * novelty - 0.3 * linkFlag + 0.1 * ctaShare),
-    quote: sigmoid(base + 0.4 * form.controversy + 0.2 * novelty),
-    click: sigmoid(base + 0.9 * linkFlag + 0.2 * hook),
-    profileClick: sigmoid(base + 0.5 * authorQuality + 0.2 * novelty),
-    videoView: sigmoid(base + 1.2 * isVideo + 0.2 * hook),
-    photoExpand: sigmoid(base + 1.0 * isImage + 0.1 * hook),
-    share: sigmoid(base + 0.5 * shareability + 0.2 * novelty),
-    dwell: sigmoid(base + 0.2 * lengthScore + 0.4 * mediaScore - 0.2 * linkFlag),
-    followAuthor: sigmoid(base + 0.6 * authorQuality + 0.2 * hook),
-    notInterested: sigmoid(-1.0 + 2.2 * negativeRisk + 0.6 * topicSaturation - 0.8 * audienceAlignment),
-    block: sigmoid(-2.0 + 2.6 * negativeRisk + 0.6 * form.controversy),
-    mute: sigmoid(-1.8 + 2.3 * negativeRisk + 0.8 * topicSaturation),
-    report: sigmoid(-2.4 + 2.8 * negativeRisk + 0.6 * form.controversy),
+    like,
+    reply,
+    repost,
+    quote,
+    click,
+    profileClick,
+    videoView,
+    photoExpand,
+    share,
+    shareDm,
+    shareLink,
+    dwell,
+    followAuthor,
+    quotedClick,
+    notInterested,
+    block,
+    mute,
+    report,
+    dwellTime,
   };
 
   const weightedScore = weightedScoreFrom(actions);
+  const diversityMultiplier = 1;
+  const oonMultiplier = 1;
+  const finalScore = weightedScore * diversityMultiplier * oonMultiplier;
 
   const timeScore = timeOfDayScore(form.hourOfDay);
   const activeFraction = 0.015 + 0.08 * timeScore;
@@ -1968,7 +2226,7 @@ function simulateLocal(form: FormState): SimulationResult {
   const expectedActionVolume = impressionsTotal * actionVolumeRateValue;
   const expectedUniqueEngagements = impressionsTotal * uniqueEngagementRateValue;
 
-  const raw = (weightedScore - 1) * 0.8 + (log10Safe(impressionsTotal + 1) - 3) * 0.4;
+  const raw = (finalScore - 1) * 0.8 + (log10Safe(impressionsTotal + 1) - 3) * 0.4;
   const score = 100 * sigmoid(raw);
   const tier = tierFromScore(score);
 
@@ -1992,7 +2250,11 @@ function simulateLocal(form: FormState): SimulationResult {
   return {
     score,
     tier,
+    scoringMode: "heuristic",
     weightedScore,
+    diversityMultiplier,
+    oonMultiplier,
+    finalScore,
     impressionsIn,
     impressionsOon,
     impressionsTotal,
@@ -2001,6 +2263,7 @@ function simulateLocal(form: FormState): SimulationResult {
     uniqueEngagementRate: uniqueEngagementRateValue,
     actionVolumeRate: actionVolumeRateValue,
     actions,
+    phoenixActions: undefined,
     signals,
     suggestions,
     warnings: [],
@@ -2168,16 +2431,20 @@ function positiveActionProbs(actions: ActionProbs) {
     actions.repost,
     actions.quote,
     actions.share,
+    actions.shareDm,
+    actions.shareLink,
     actions.click,
     actions.profileClick,
     actions.followAuthor,
     actions.videoView,
     actions.photoExpand,
+    actions.quotedClick,
   ];
 }
 
 function weightedScoreFrom(actions: ActionProbs) {
-  return (
+  const score =
+    (
     actions.like * 1.0 +
     actions.reply * 1.6 +
     actions.repost * 2.0 +
@@ -2187,13 +2454,21 @@ function weightedScoreFrom(actions: ActionProbs) {
     actions.videoView * 0.5 +
     actions.photoExpand * 0.3 +
     actions.share * 1.4 +
+    actions.shareDm * 0.8 +
+    actions.shareLink * 0.6 +
     actions.dwell * 0.2 +
+    actions.quotedClick * 0.5 +
     actions.followAuthor * 1.2 +
     actions.notInterested * -2.5 +
     actions.block * -5.0 +
     actions.mute * -3.0 +
-    actions.report * -6.0
+    actions.report * -6.0 +
+    actions.dwellTime * 0.1
   );
+  if (score < 0) {
+    return score + 1.0;
+  }
+  return score;
 }
 
 function tierFromScore(score: number) {
@@ -2233,6 +2508,13 @@ function sigmoid(x: number) {
   return 1 / (1 + Math.exp(-x));
 }
 
+function estimateDwellTime(charCount: number, mediaScore: number, dwellProb: number) {
+  const base = 1.5 + charCount / 80;
+  const mediaLift = 6 * mediaScore;
+  const dwellLift = 10 * dwellProb;
+  return Math.max(0, Math.min(60, base + mediaLift + dwellLift));
+}
+
 function clamp01(value: number) {
   if (!Number.isFinite(value)) return 0;
   return Math.min(1, Math.max(0, value));
@@ -2254,6 +2536,13 @@ function formatNumber(value: number) {
 
 function formatPercent(value: number) {
   return `${(value * 100).toFixed(1)}%`;
+}
+
+function formatActionValue(key: string, value: number) {
+  if (key === "dwellTime") {
+    return `${value.toFixed(1)}s`;
+  }
+  return formatPercent(value);
 }
 
 function formatFloat(value: number, digits: number) {

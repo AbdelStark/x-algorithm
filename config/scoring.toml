@@ -1,0 +1,40 @@
+[scoring]
+mode = "hybrid"
+phoenix_weight = 0.7
+
+[weights]
+favorite = 1.0
+reply = 1.6
+repost = 2.0
+photo_expand = 0.3
+click = 0.4
+profile_click = 0.3
+vqv = 0.5
+share = 1.4
+share_dm = 0.8
+share_link = 0.6
+dwell = 0.2
+quote = 1.7
+quoted_click = 0.5
+follow_author = 1.2
+not_interested = -2.5
+block = -5.0
+mute = -3.0
+report = -6.0
+dwell_time = 0.1
+
+[weighted]
+vqv_duration_threshold = 6.0
+score_offset = 1.0
+
+[diversity]
+decay = 0.7
+floor = 0.1
+
+[oon]
+multiplier = 0.8
+
+[phoenix]
+endpoint = "http://localhost:8000"
+timeout_ms = 5000
+history_limit = 50

@@ -8,6 +8,10 @@ pub struct ApiSimulationRequest {
     pub text: Option<String>,
     pub request_id: Option<String>,
     pub media: Option<String>,
+    pub post_id: Option<String>,
+    pub author_id: Option<String>,
+    pub is_oon: Option<bool>,
+    pub video_duration_seconds: Option<f64>,
     pub has_link: Option<bool>,
     pub followers: Option<u64>,
     pub following: Option<u64>,
@@ -23,13 +27,17 @@ pub struct ApiSimulationRequest {
     pub controversy: Option<f64>,
     pub sentiment: Option<f64>,
     pub use_ai: Option<bool>,
+    pub scoring_mode: Option<String>,
+    pub phoenix_weight: Option<f64>,
+    pub user_id: Option<String>,
 }
 
 impl ApiSimulationRequest {
-    pub fn into_input(self) -> Result<SimulatorInput, String> {
+    pub fn into_input(&self) -> Result<SimulatorInput, String> {
         let mut input = SimulatorInput::default();
         let text = self
             .text
+            .clone()
             .unwrap_or_default()
             .trim()
             .to_string();
@@ -41,6 +49,19 @@ impl ApiSimulationRequest {
         if let Some(media) = self.media.as_deref() {
             input.media = MediaType::from_str(media)
                 .ok_or_else(|| format!("invalid media type: {}", media))?;
+        }
+
+        if let Some(post_id) = self.post_id.as_ref() {
+            input.post_id = Some(post_id.clone());
+        }
+        if let Some(author_id) = self.author_id.as_ref() {
+            input.author_id = Some(author_id.clone());
+        }
+        if let Some(is_oon) = self.is_oon {
+            input.is_oon = is_oon;
+        }
+        if let Some(duration) = self.video_duration_seconds {
+            input.video_duration_seconds = Some(duration);
         }
 
         if let Some(has_link) = self.has_link {
@@ -96,7 +117,11 @@ pub struct ApiSimulationResponse {
     pub request_id: String,
     pub score: f64,
     pub tier: String,
+    pub scoring_mode: String,
     pub weighted_score: f64,
+    pub diversity_multiplier: f64,
+    pub oon_multiplier: f64,
+    pub final_score: f64,
     pub impressions_in: f64,
     pub impressions_oon: f64,
     pub impressions_total: f64,
@@ -105,6 +130,7 @@ pub struct ApiSimulationResponse {
     pub unique_engagement_rate: f64,
     pub action_volume_rate: f64,
     pub actions: ActionProbs,
+    pub phoenix_actions: Option<ActionProbs>,
     pub signals: Signals,
     pub suggestions: Vec<String>,
     pub llm: Option<LlmScore>,
@@ -118,7 +144,11 @@ impl ApiSimulationResponse {
             request_id,
             score: output.score,
             tier: output.tier.label().to_string(),
+            scoring_mode: output.scoring_mode.label().to_string(),
             weighted_score: output.weighted_score,
+            diversity_multiplier: output.diversity_multiplier,
+            oon_multiplier: output.oon_multiplier,
+            final_score: output.final_score,
             impressions_in: output.impressions_in,
             impressions_oon: output.impressions_oon,
             impressions_total: output.impressions_total,
@@ -127,6 +157,7 @@ impl ApiSimulationResponse {
             unique_engagement_rate: output.unique_engagement_rate,
             action_volume_rate: output.action_volume_rate,
             actions: output.actions,
+            phoenix_actions: output.phoenix_actions,
             signals: output.signals,
             suggestions: output.suggestions,
             llm: output.llm,

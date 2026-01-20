@@ -371,6 +371,18 @@ body {
   color: var(--text);
 }
 
+.inline-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.user-status {
+  margin-top: 8px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
 .inline-toggle {
   display: flex;
   flex-wrap: wrap;

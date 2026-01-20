@@ -5,7 +5,7 @@ use axum::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse,
     },
-    routing::{get, post},
+    routing::{get, post, put},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -19,7 +19,7 @@ use std::{
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 use tower_http::services::{ServeDir, ServeFile};
 
@@ -27,11 +27,18 @@ use crate::api::{ApiSimulationRequest, ApiSimulationResponse};
 use crate::llm::{prompt_for_text, LlmClient};
 use crate::snapshots::{Snapshot, SnapshotStore};
 use crate::x_api::{XApiClient, XUserProfile};
-use virality_sim::simulate_with_llm;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
+use virality_sim::config::ScoringConfig;
+use virality_sim::phoenix_client::{PhoenixClient, PostFeatures, RankingRequest};
+use virality_sim::scoring::ActionWeights;
+use virality_sim::user::{
+    action_flags_to_vector, generate_synthetic_history, profile_from_input, EngagementEvent,
+    UserProfile, UserProfileStore,
+};
+use virality_sim::{simulate_with_mode, ActionProbs, MediaType, ScoringMode, SimulatorInput};
 
 #[derive(Clone)]
 struct AppState {
@@ -41,6 +48,9 @@ struct AppState {
     oauth_state: Arc<Mutex<HashMap<String, String>>>,
     channels: Arc<Mutex<HashMap<String, broadcast::Sender<StreamEvent>>>>,
     snapshots: Arc<SnapshotStore>,
+    user_profiles: Arc<UserProfileStore>,
+    scoring_config: Arc<RwLock<ScoringConfig>>,
+    scoring_config_path: Option<PathBuf>,
 }
 
 #[derive(Clone, Serialize)]
@@ -96,6 +106,9 @@ static REQUEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
 pub async fn serve(args: crate::ServeArgs) -> Result<(), String> {
     let snapshot_path = snapshot_path();
     let snapshot_store = SnapshotStore::load(snapshot_path).await?;
+    let profiles_path = user_profiles_path();
+    let user_profiles = UserProfileStore::load(profiles_path).await?;
+    let (scoring_config, scoring_config_path) = ScoringConfig::load(None)?;
     let state = AppState {
         llm_client: LlmClient::from_env(None),
         x_client: XApiClient::from_env(),
@@ -103,6 +116,9 @@ pub async fn serve(args: crate::ServeArgs) -> Result<(), String> {
         oauth_state: Arc::new(Mutex::new(HashMap::new())),
         channels: Arc::new(Mutex::new(HashMap::new())),
         snapshots: Arc::new(snapshot_store),
+        user_profiles: Arc::new(user_profiles),
+        scoring_config: Arc::new(RwLock::new(scoring_config)),
+        scoring_config_path,
     };
 
     let web_root = args.web_root;
@@ -112,7 +128,13 @@ pub async fn serve(args: crate::ServeArgs) -> Result<(), String> {
     let app = Router::new()
         .route("/api/health", get(health))
         .route("/api/simulate", post(simulate_handler))
+        .route("/api/simulate/phoenix", post(simulate_phoenix_handler))
+        .route("/api/simulate/compare", post(compare_handler))
         .route("/api/simulate/stream", get(stream_handler))
+        .route("/api/config", get(get_config))
+        .route("/api/config/weights", put(update_weights))
+        .route("/api/users", post(upsert_user))
+        .route("/api/users/:user_id/history", get(get_user_history))
         .route("/api/x/profile", get(x_profile_handler))
         .route("/api/x/me", get(x_me_handler))
         .route("/api/x/oauth/start", get(x_oauth_start))
@@ -149,7 +171,7 @@ async fn simulate_handler(
         .request_id
         .clone()
         .unwrap_or_else(generate_request_id);
-    let input = request.into_input().map_err(|err| (StatusCode::BAD_REQUEST, err))?;
+    let mut input = request.into_input().map_err(|err| (StatusCode::BAD_REQUEST, err))?;
     let channel = if use_ai {
         Some(get_or_create_channel(&state, &request_id).await)
     } else {
@@ -216,10 +238,34 @@ async fn simulate_handler(
         send_event(sender, "merge", "Merging Grok signals into model");
     }
 
-    let output = simulate_with_llm(
+    let scoring_config = state.scoring_config.read().await.clone();
+    let mut scoring_mode = resolve_scoring_mode(&request, &scoring_config, &mut warnings);
+
+    let mut phoenix_actions = None;
+    if matches!(scoring_mode, ScoringMode::Phoenix | ScoringMode::Hybrid { .. }) {
+        if let Some(sender) = channel.as_ref() {
+            send_event(sender, "phoenix", "Calling Phoenix service");
+        }
+        match fetch_phoenix_actions(&state, &scoring_config, &mut input, &request).await {
+            Ok(actions) => phoenix_actions = Some(actions),
+            Err(err) => warnings.push(format!("Phoenix scoring failed: {}", err)),
+        }
+    }
+
+    if phoenix_actions.is_none()
+        && matches!(scoring_mode, ScoringMode::Phoenix | ScoringMode::Hybrid { .. })
+    {
+        warnings.push("Phoenix unavailable; falling back to heuristic scoring.".to_string());
+        scoring_mode = ScoringMode::Heuristic;
+    }
+
+    let output = simulate_with_mode(
         &input,
         llm_result.as_ref().map(|result| &result.score),
         llm_result.as_ref().map(|result| &result.trace),
+        scoring_mode,
+        phoenix_actions.as_ref(),
+        &scoring_config,
     );
     if let Some(sender) = channel.as_ref() {
         send_event(sender, "done", "Simulation complete");
@@ -228,6 +274,414 @@ async fn simulate_handler(
 
     let response = ApiSimulationResponse::from_output(output, warnings, request_id);
     Ok(Json(response))
+}
+
+async fn simulate_phoenix_handler(
+    State(state): State<AppState>,
+    Json(mut request): Json<ApiSimulationRequest>,
+) -> Result<Json<ApiSimulationResponse>, (StatusCode, String)> {
+    request.scoring_mode = Some("phoenix".to_string());
+    simulate_handler(State(state), Json(request)).await
+}
+
+#[derive(Deserialize)]
+struct CompareRequest {
+    candidates: Vec<ApiSimulationRequest>,
+    scoring_mode: Option<String>,
+    phoenix_weight: Option<f64>,
+    user_id: Option<String>,
+}
+
+#[derive(Serialize)]
+struct CompareResult {
+    rank: usize,
+    response: ApiSimulationResponse,
+}
+
+#[derive(Serialize)]
+struct CompareResponse {
+    results: Vec<CompareResult>,
+}
+
+async fn compare_handler(
+    State(state): State<AppState>,
+    Json(request): Json<CompareRequest>,
+) -> Result<Json<CompareResponse>, (StatusCode, String)> {
+    if request.candidates.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "candidates are required".to_string()));
+    }
+
+    let scoring_config = state.scoring_config.read().await.clone();
+    let mut responses = Vec::new();
+
+    for mut candidate in request.candidates {
+        if candidate.scoring_mode.is_none() {
+            candidate.scoring_mode = request.scoring_mode.clone();
+        }
+        if candidate.phoenix_weight.is_none() {
+            candidate.phoenix_weight = request.phoenix_weight;
+        }
+        if candidate.user_id.is_none() {
+            candidate.user_id = request.user_id.clone();
+        }
+
+        let mut warnings = Vec::new();
+        let mut input =
+            candidate.into_input().map_err(|err| (StatusCode::BAD_REQUEST, err))?;
+
+        let llm_result = if candidate.use_ai.unwrap_or(false) {
+            match &state.llm_client {
+                Some(client) => match client.score_text(&input.text).await {
+                    Ok(result) => Some(result),
+                    Err(err) => {
+                        warnings.push(format!("AI scoring failed: {}", err));
+                        None
+                    }
+                },
+                None => {
+                    warnings.push("AI scoring not configured: set XAI_API_KEY".to_string());
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let mut scoring_mode = resolve_scoring_mode(&candidate, &scoring_config, &mut warnings);
+        let mut phoenix_actions = None;
+        if matches!(scoring_mode, ScoringMode::Phoenix | ScoringMode::Hybrid { .. }) {
+            match fetch_phoenix_actions(&state, &scoring_config, &mut input, &candidate).await {
+                Ok(actions) => phoenix_actions = Some(actions),
+                Err(err) => warnings.push(format!("Phoenix scoring failed: {}", err)),
+            }
+        }
+
+        if phoenix_actions.is_none()
+            && matches!(scoring_mode, ScoringMode::Phoenix | ScoringMode::Hybrid { .. })
+        {
+            warnings.push("Phoenix unavailable; falling back to heuristic scoring.".to_string());
+            scoring_mode = ScoringMode::Heuristic;
+        }
+
+        let output = simulate_with_mode(
+            &input,
+            llm_result.as_ref().map(|result| &result.score),
+            llm_result.as_ref().map(|result| &result.trace),
+            scoring_mode,
+            phoenix_actions.as_ref(),
+            &scoring_config,
+        );
+
+        let request_id = candidate
+            .request_id
+            .clone()
+            .unwrap_or_else(generate_request_id);
+        let response = ApiSimulationResponse::from_output(output, warnings, request_id);
+        responses.push(response);
+    }
+
+    responses.sort_by(|a, b| {
+        b.final_score
+            .partial_cmp(&a.final_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let results = responses
+        .into_iter()
+        .enumerate()
+        .map(|(idx, response)| CompareResult {
+            rank: idx + 1,
+            response,
+        })
+        .collect();
+
+    Ok(Json(CompareResponse { results }))
+}
+
+async fn get_config(State(state): State<AppState>) -> Json<ScoringConfig> {
+    let config = state.scoring_config.read().await.clone();
+    Json(config)
+}
+
+#[derive(Deserialize)]
+struct UpdateWeightsRequest {
+    weights: ActionWeights,
+}
+
+async fn update_weights(
+    State(state): State<AppState>,
+    Json(request): Json<UpdateWeightsRequest>,
+) -> Result<Json<ScoringConfig>, (StatusCode, String)> {
+    let mut config = state.scoring_config.write().await;
+    config.weights = request.weights.clone();
+
+    if let Some(path) = state.scoring_config_path.as_ref() {
+        config
+            .write(path)
+            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err))?;
+    }
+
+    Ok(Json(config.clone()))
+}
+
+#[derive(Deserialize)]
+struct UserProfileRequest {
+    user_id: String,
+    followers: Option<u64>,
+    following: Option<u64>,
+    account_age_days: Option<u32>,
+    verified: Option<bool>,
+    engagement_history: Option<Vec<EngagementEvent>>,
+    generate_synthetic_history: Option<bool>,
+    synthetic_seed: Option<u64>,
+}
+
+async fn upsert_user(
+    State(state): State<AppState>,
+    Json(request): Json<UserProfileRequest>,
+) -> Result<Json<UserProfile>, (StatusCode, String)> {
+    let user_id = request.user_id.trim();
+    if user_id.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "user_id is required".to_string()));
+    }
+
+    let existing = state.user_profiles.get(user_id).await;
+    let mut profile = existing.unwrap_or(UserProfile {
+        user_id: user_id.to_string(),
+        followers: request.followers.unwrap_or(0),
+        following: request.following.unwrap_or(0),
+        account_age_days: request.account_age_days.unwrap_or(0),
+        verified: request.verified.unwrap_or(false),
+        engagement_history: Vec::new(),
+    });
+
+    if let Some(followers) = request.followers {
+        profile.followers = followers;
+    }
+    if let Some(following) = request.following {
+        profile.following = following;
+    }
+    if let Some(account_age_days) = request.account_age_days {
+        profile.account_age_days = account_age_days;
+    }
+    if let Some(verified) = request.verified {
+        profile.verified = verified;
+    }
+    if let Some(history) = request.engagement_history {
+        profile.engagement_history = history;
+    }
+    if request.generate_synthetic_history.unwrap_or(false) {
+        let seed = request
+            .synthetic_seed
+            .unwrap_or_else(|| stable_hash64(user_id));
+        profile.engagement_history = generate_synthetic_history(&profile, seed);
+    }
+
+    let saved = state
+        .user_profiles
+        .upsert(profile)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err))?;
+
+    Ok(Json(saved))
+}
+
+async fn get_user_history(
+    State(state): State<AppState>,
+    axum::extract::Path(user_id): axum::extract::Path<String>,
+) -> Result<Json<Vec<EngagementEvent>>, (StatusCode, String)> {
+    match state.user_profiles.get(&user_id).await {
+        Some(profile) => Ok(Json(profile.engagement_history)),
+        None => Err((StatusCode::NOT_FOUND, "user not found".to_string())),
+    }
+}
+
+fn resolve_scoring_mode(
+    request: &ApiSimulationRequest,
+    config: &ScoringConfig,
+    warnings: &mut Vec<String>,
+) -> ScoringMode {
+    let mut mode = config.scoring.to_mode();
+
+    if let Some(raw_mode) = request.scoring_mode.as_deref() {
+        match raw_mode.to_lowercase().as_str() {
+            "heuristic" => mode = ScoringMode::Heuristic,
+            "phoenix" => mode = ScoringMode::Phoenix,
+            "hybrid" => {
+                let weight = request
+                    .phoenix_weight
+                    .unwrap_or(config.scoring.phoenix_weight)
+                    .clamp(0.0, 1.0);
+                mode = ScoringMode::Hybrid {
+                    phoenix_weight: weight,
+                };
+            }
+            _ => warnings.push(format!(
+                "Unknown scoring_mode '{}'; using config default.",
+                raw_mode
+            )),
+        }
+    }
+
+    if let Some(weight) = request.phoenix_weight {
+        if matches!(mode, ScoringMode::Hybrid { .. }) {
+            mode = ScoringMode::Hybrid {
+                phoenix_weight: weight.clamp(0.0, 1.0),
+            };
+        }
+    }
+
+    mode
+}
+
+async fn fetch_phoenix_actions(
+    state: &AppState,
+    scoring_config: &ScoringConfig,
+    input: &mut SimulatorInput,
+    request: &ApiSimulationRequest,
+) -> Result<ActionProbs, String> {
+    let client = PhoenixClient::from_config(scoring_config)?;
+    let (post_id, author_id) = ensure_candidate_ids(input);
+    let candidate = build_post_features(input, &post_id, &author_id);
+
+    let user_id = derive_user_id(input, request);
+    let (history_posts, history_actions) =
+        build_history(state, &user_id, input, scoring_config.phoenix.history_limit).await?;
+    let ranking_request = RankingRequest {
+        user_id,
+        user_embedding: None,
+        history_posts,
+        history_actions,
+        candidates: vec![candidate],
+    };
+
+    let response = client.score(ranking_request).await?;
+    let score = response
+        .scores
+        .iter()
+        .find(|candidate| candidate.post_id == post_id)
+        .or_else(|| response.scores.first())
+        .ok_or_else(|| "Phoenix response missing scores".to_string())?;
+    Ok(score.phoenix_scores.clone())
+}
+
+async fn build_history(
+    state: &AppState,
+    user_id: &str,
+    input: &SimulatorInput,
+    history_limit: usize,
+) -> Result<(Vec<PostFeatures>, Vec<Vec<f32>>), String> {
+    let mut profile = state.user_profiles.get(user_id).await;
+    let seed = stable_hash64(user_id);
+
+    if profile.is_none() {
+        let mut new_profile = profile_from_input(user_id.to_string(), input);
+        new_profile.engagement_history = generate_synthetic_history(&new_profile, seed);
+        state.user_profiles.upsert(new_profile.clone()).await?;
+        profile = Some(new_profile);
+    }
+
+    let mut profile = profile.expect("profile must be initialized");
+    if profile.engagement_history.is_empty() {
+        profile.engagement_history = generate_synthetic_history(&profile, seed);
+        state.user_profiles.upsert(profile.clone()).await?;
+    }
+
+    let history = if profile.engagement_history.len() > history_limit {
+        let start = profile.engagement_history.len() - history_limit;
+        &profile.engagement_history[start..]
+    } else {
+        &profile.engagement_history[..]
+    };
+
+    let history_posts = history
+        .iter()
+        .map(|event| PostFeatures {
+            post_id: event.post_id.clone(),
+            author_id: event.author_id.clone(),
+            text_hash: stable_hash64(&event.post_id),
+            author_hash: stable_hash64(&event.author_id),
+            product_surface: 0,
+            video_duration_seconds: None,
+        })
+        .collect();
+
+    let history_actions = history
+        .iter()
+        .map(|event| action_flags_to_vector(&event.actions))
+        .collect();
+
+    Ok((history_posts, history_actions))
+}
+
+fn ensure_candidate_ids(input: &mut SimulatorInput) -> (String, String) {
+    let post_id = input.post_id.clone().unwrap_or_else(|| {
+        let hash = stable_hash64(&input.text);
+        format!("post_{:x}", hash)
+    });
+    if input.post_id.is_none() {
+        input.post_id = Some(post_id.clone());
+    }
+
+    let author_id = input.author_id.clone().unwrap_or_else(|| {
+        let payload = format!(
+            "{}:{}:{}:{}",
+            input.followers, input.following, input.account_age_days, input.verified
+        );
+        let hash = stable_hash64(&payload);
+        format!("author_{:x}", hash)
+    });
+    if input.author_id.is_none() {
+        input.author_id = Some(author_id.clone());
+    }
+
+    (post_id, author_id)
+}
+
+fn build_post_features(
+    input: &SimulatorInput,
+    post_id: &str,
+    author_id: &str,
+) -> PostFeatures {
+    let video_duration_seconds = input.video_duration_seconds.or_else(|| {
+        if matches!(input.media, MediaType::Video) {
+            Some(15.0)
+        } else {
+            None
+        }
+    });
+
+    PostFeatures {
+        post_id: post_id.to_string(),
+        author_id: author_id.to_string(),
+        text_hash: stable_hash64(&input.text),
+        author_hash: stable_hash64(author_id),
+        product_surface: 0,
+        video_duration_seconds,
+    }
+}
+
+fn derive_user_id(input: &SimulatorInput, request: &ApiSimulationRequest) -> String {
+    request
+        .user_id
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| {
+            let payload = format!(
+                "{}:{}:{}",
+                input.followers, input.following, input.account_age_days
+            );
+            format!("user_{:x}", stable_hash64(&payload))
+        })
+}
+
+fn stable_hash64(value: &str) -> u64 {
+    let mut hasher = Sha256::new();
+    hasher.update(value.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&digest[..8]);
+    u64::from_be_bytes(bytes)
 }
 
 #[derive(Deserialize)]
@@ -616,6 +1070,13 @@ fn snapshot_path() -> PathBuf {
         return PathBuf::from(path);
     }
     PathBuf::from("data").join("snapshots.json")
+}
+
+fn user_profiles_path() -> PathBuf {
+    if let Ok(path) = std::env::var("USER_PROFILES_PATH") {
+        return PathBuf::from(path);
+    }
+    PathBuf::from("data").join("user_profiles.json")
 }
 
 fn chrono_like_timestamp() -> String {

@@ -7,6 +7,8 @@ mod x_api;
 use clap::{Args, Parser, Subcommand};
 use std::io::{self, Read};
 use std::path::Path;
+use virality_sim::calibration::{CalibrationRunner, CalibrationSample, WeightTuner};
+use virality_sim::config::ScoringConfig;
 use virality_sim::{
     format_float, format_number, format_percent, simulate_with_llm, MediaType, SimulatorInput,
 };
@@ -22,6 +24,7 @@ struct Cli {
 enum Command {
     Simulate(SimulateArgs),
     Serve(ServeArgs),
+    Calibrate(CalibrateArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -105,6 +108,16 @@ pub struct ServeArgs {
     web_root: String,
 }
 
+#[derive(Args, Debug, Clone)]
+struct CalibrateArgs {
+    #[arg(long)]
+    data: Option<String>,
+    #[arg(long)]
+    tune: bool,
+    #[arg(long)]
+    report: Option<String>,
+}
+
 #[tokio::main]
 async fn main() {
     load_dotenv();
@@ -121,6 +134,7 @@ async fn run() -> Result<(), String> {
     match command {
         Command::Simulate(args) => run_simulate(args).await,
         Command::Serve(args) => server::serve(args).await,
+        Command::Calibrate(args) => run_calibrate(args).await,
     }
 }
 
@@ -172,7 +186,9 @@ async fn run_simulate(args: SimulateArgs) -> Result<(), String> {
         format_float(output.score, 1),
         output.tier.label()
     );
+    println!("Scoring mode: {}", output.scoring_mode.label());
     println!("Weighted score: {}", format_float(output.weighted_score, 2));
+    println!("Final score: {}", format_float(output.final_score, 2));
     println!(
         "Estimated impressions: {} (in-network {} | out-of-network {})",
         format_number(output.impressions_total),
@@ -231,12 +247,16 @@ async fn run_simulate(args: SimulateArgs) -> Result<(), String> {
         println!("  repost: {}", format_percent(output.actions.repost));
         println!("  quote: {}", format_percent(output.actions.quote));
         println!("  share: {}", format_percent(output.actions.share));
+        println!("  share_dm: {}", format_percent(output.actions.share_dm));
+        println!("  share_link: {}", format_percent(output.actions.share_link));
         println!("  click: {}", format_percent(output.actions.click));
         println!("  profile_click: {}", format_percent(output.actions.profile_click));
         println!("  follow_author: {}", format_percent(output.actions.follow_author));
         println!("  video_view: {}", format_percent(output.actions.video_view));
         println!("  photo_expand: {}", format_percent(output.actions.photo_expand));
+        println!("  quoted_click: {}", format_percent(output.actions.quoted_click));
         println!("  dwell: {}", format_percent(output.actions.dwell));
+        println!("  dwell_time: {}", format_float(output.actions.dwell_time, 2));
         println!("  not_interested: {}", format_percent(output.actions.not_interested));
         println!("  mute: {}", format_percent(output.actions.mute));
         println!("  block: {}", format_percent(output.actions.block));
@@ -248,6 +268,57 @@ async fn run_simulate(args: SimulateArgs) -> Result<(), String> {
         for suggestion in output.suggestions {
             println!("- {}", suggestion);
         }
+    }
+
+    Ok(())
+}
+
+async fn run_calibrate(args: CalibrateArgs) -> Result<(), String> {
+    let data_path = args
+        .data
+        .or_else(|| std::env::var("CALIBRATION_DATA_PATH").ok())
+        .unwrap_or_else(|| "data/calibration.json".to_string());
+
+    let raw = std::fs::read_to_string(&data_path)
+        .map_err(|err| format!("failed to read calibration data: {}", err))?;
+    let samples: Vec<CalibrationSample> = serde_json::from_str(&raw)
+        .map_err(|err| format!("failed to parse calibration data: {}", err))?;
+
+    let (config, _) = ScoringConfig::load(None)?;
+    let runner = CalibrationRunner::new(samples.clone());
+    let metrics = runner.compute_metrics(&config);
+
+    println!("Calibration samples: {}", metrics.sample_count);
+    println!(
+        "Impression correlation: {:.3}",
+        metrics.impression_correlation
+    );
+    println!(
+        "Engagement rate correlation: {:.3}",
+        metrics.engagement_rate_correlation
+    );
+    println!("Like rate MAE: {:.4}", metrics.like_rate_mae);
+    println!("Reply rate MAE: {:.4}", metrics.reply_rate_mae);
+    println!("Repost rate MAE: {:.4}", metrics.repost_rate_mae);
+    println!(
+        "Pairwise ranking accuracy: {:.3}",
+        metrics.pairwise_ranking_accuracy
+    );
+
+    if let Some(report_path) = args.report.as_ref() {
+        let payload = serde_json::to_string_pretty(&metrics)
+            .map_err(|err| format!("failed to serialize calibration report: {}", err))?;
+        std::fs::write(report_path, payload)
+            .map_err(|err| format!("failed to write calibration report: {}", err))?;
+        println!("Saved calibration report to {}", report_path);
+    }
+
+    if args.tune {
+        let tuner = WeightTuner::new(samples);
+        let tuned = tuner.tune(config.weights.clone(), &config);
+        let payload = toml::to_string_pretty(&tuned)
+            .map_err(|err| format!("failed to serialize tuned weights: {}", err))?;
+        println!("\nTuned weights:\n{}", payload);
     }
 
     Ok(())

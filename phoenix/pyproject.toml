@@ -6,9 +6,11 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "dm-haiku>=0.0.13",
+    "fastapi>=0.111.0",
     "jax==0.8.1",
     "numpy>=1.26.4",
     "pyright>=1.1.408",
+    "uvicorn>=0.30.0",
 ]
 
 [tool.uv]
