@@ -1,4 +1,6 @@
 import hashlib
+import logging
+import time
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -15,6 +17,7 @@ DEFAULT_HISTORY_LEN = 50
 DEFAULT_CANDIDATE_LEN = 10
 VQV_DURATION_THRESHOLD = 6.0
 SCORE_OFFSET = 1.0
+logger = logging.getLogger("phoenix.inference")
 
 
 @dataclass
@@ -50,10 +53,31 @@ class PhoenixRanker:
         )
         runner.initialize()
         self._runner = runner
+        logger.info(
+            "Phoenix runner initialized (history_len=%s candidate_len=%s emb_size=%s).",
+            self.history_len,
+            self.candidate_len,
+            self.emb_size,
+        )
 
     def rank(self, request: RankingRequest) -> RankingResponse:
         if self._runner is None:
             raise RuntimeError("PhoenixRanker is not initialized")
+
+        start = time.perf_counter()
+        history_len = len(request.history_posts)
+        candidate_len = len(request.candidates)
+        logger.info(
+            "Rank start user_id=%s history_len=%s candidates=%s",
+            request.user_id,
+            history_len,
+            candidate_len,
+        )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "Candidates: %s",
+                [candidate.post_id for candidate in request.candidates],
+            )
 
         batch = build_batch(request, self._runner.runner.model)
         embeddings = build_embeddings(batch, self._runner.runner.model.emb_size)
@@ -81,6 +105,18 @@ class PhoenixRanker:
                     rank=rank_map.get(idx, candidate_count),
                 )
             )
+
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        top_score = float(primary_scores.max()) if candidate_count > 0 else 0.0
+        logger.info(
+            "Rank complete user_id=%s candidates=%s elapsed_ms=%.2f top_primary=%.4f",
+            request.user_id,
+            candidate_count,
+            elapsed_ms,
+            top_score,
+        )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("Rank map: %s", rank_map)
 
         return RankingResponse(scores=candidate_scores)
 
@@ -134,6 +170,15 @@ def build_batch(request: RankingRequest, model: PhoenixModelConfig) -> RecsysBat
             str(candidate.author_hash), hash_config.num_author_hashes, VOCAB_SIZE
         )
         candidate_product_surface[0, idx] = candidate.product_surface
+
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(
+            "Batch shapes user=%s history_posts=%s history_actions=%s candidates=%s",
+            user_hashes.shape,
+            history_post_hashes.shape,
+            history_actions.shape,
+            candidate_post_hashes.shape,
+        )
 
     return RecsysBatch(
         user_hashes=user_hashes,

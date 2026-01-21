@@ -8,6 +8,17 @@ from .schema import RankingRequest, RankingResponse
 logger = logging.getLogger("phoenix.service")
 
 
+def setup_logging() -> None:
+    level_name = os.getenv("PHOENIX_LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
+    logger.setLevel(level)
+    logging.getLogger("phoenix.inference").setLevel(level)
+
+
 def env_int(name: str, default: int) -> int:
     value = os.getenv(name)
     if value is None:
@@ -28,9 +39,15 @@ ranker = PhoenixRanker(
 
 @app.on_event("startup")
 async def startup_event() -> None:
+    setup_logging()
     logger.info("Initializing Phoenix ranker...")
     ranker.initialize()
-    logger.info("Phoenix ranker ready.")
+    logger.info(
+        "Phoenix ranker ready (history_len=%s candidate_len=%s emb_size=%s).",
+        ranker.history_len,
+        ranker.candidate_len,
+        ranker.emb_size,
+    )
 
 
 @app.post("/rank", response_model=RankingResponse)

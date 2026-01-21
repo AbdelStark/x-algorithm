@@ -22,6 +22,7 @@ use std::{
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 use tower_http::services::{ServeDir, ServeFile};
+use tracing::{debug, info, warn};
 
 use crate::api::{ApiSimulationRequest, ApiSimulationResponse};
 use crate::llm::{prompt_for_text, LlmClient};
@@ -105,9 +106,9 @@ static REQUEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 pub async fn serve(args: crate::ServeArgs) -> Result<(), String> {
     let snapshot_path = snapshot_path();
-    let snapshot_store = SnapshotStore::load(snapshot_path).await?;
+    let snapshot_store = SnapshotStore::load(snapshot_path.clone()).await?;
     let profiles_path = user_profiles_path();
-    let user_profiles = UserProfileStore::load(profiles_path).await?;
+    let user_profiles = UserProfileStore::load(profiles_path.clone()).await?;
     let (scoring_config, scoring_config_path) = ScoringConfig::load(None)?;
     let state = AppState {
         llm_client: LlmClient::from_env(None),
@@ -120,6 +121,25 @@ pub async fn serve(args: crate::ServeArgs) -> Result<(), String> {
         scoring_config: Arc::new(RwLock::new(scoring_config)),
         scoring_config_path,
     };
+
+    info!(
+        host = %args.host,
+        port = args.port,
+        web_root = %args.web_root,
+        "Starting simulator server"
+    );
+    let config_snapshot = state.scoring_config.read().await.clone();
+    info!(
+        scoring_mode = %config_snapshot.scoring.mode,
+        phoenix_endpoint = %config_snapshot.phoenix.endpoint,
+        phoenix_timeout_ms = config_snapshot.phoenix.timeout_ms,
+        "Loaded scoring configuration"
+    );
+    info!(snapshot_path = %snapshot_path.display(), "Snapshot storage");
+    info!(profiles_path = %profiles_path.display(), "User profile storage");
+    if let Some(path) = state.scoring_config_path.as_ref() {
+        info!(config_path = %path.display(), "Scoring config path");
+    }
 
     let web_root = args.web_root;
     let index_path = format!("{}/index.html", web_root.trim_end_matches('/'));
@@ -172,6 +192,18 @@ async fn simulate_handler(
         .clone()
         .unwrap_or_else(generate_request_id);
     let mut input = request.into_input().map_err(|err| (StatusCode::BAD_REQUEST, err))?;
+    let start = Instant::now();
+    info!(
+        request_id = %request_id,
+        text_len = input.text.len(),
+        media = ?input.media,
+        is_oon = input.is_oon,
+        followers = input.followers,
+        following = input.following,
+        user_id = ?request.user_id,
+        use_ai = use_ai,
+        "Simulation request received"
+    );
     let channel = if use_ai {
         Some(get_or_create_channel(&state, &request_id).await)
     } else {
@@ -240,21 +272,33 @@ async fn simulate_handler(
 
     let scoring_config = state.scoring_config.read().await.clone();
     let mut scoring_mode = resolve_scoring_mode(&request, &scoring_config, &mut warnings);
+    info!(
+        request_id = %request_id,
+        scoring_mode = %scoring_mode.label(),
+        "Resolved scoring mode"
+    );
 
     let mut phoenix_actions = None;
     if matches!(scoring_mode, ScoringMode::Phoenix | ScoringMode::Hybrid { .. }) {
         if let Some(sender) = channel.as_ref() {
             send_event(sender, "phoenix", "Calling Phoenix service");
         }
-        match fetch_phoenix_actions(&state, &scoring_config, &mut input, &request).await {
+        match fetch_phoenix_actions(&state, &scoring_config, &mut input, &request, &request_id).await {
             Ok(actions) => phoenix_actions = Some(actions),
-            Err(err) => warnings.push(format!("Phoenix scoring failed: {}", err)),
+            Err(err) => {
+                warn!(request_id = %request_id, error = %err, "Phoenix scoring failed");
+                warnings.push(format!("Phoenix scoring failed: {}", err));
+            }
         }
     }
 
     if phoenix_actions.is_none()
         && matches!(scoring_mode, ScoringMode::Phoenix | ScoringMode::Hybrid { .. })
     {
+        warn!(
+            request_id = %request_id,
+            "Phoenix unavailable; falling back to heuristic scoring"
+        );
         warnings.push("Phoenix unavailable; falling back to heuristic scoring.".to_string());
         scoring_mode = ScoringMode::Heuristic;
     }
@@ -271,6 +315,14 @@ async fn simulate_handler(
         send_event(sender, "done", "Simulation complete");
         schedule_cleanup(state.channels.clone(), request_id.clone());
     }
+
+    info!(
+        request_id = %request_id,
+        scoring_mode = %output.scoring_mode.label(),
+        final_score = output.final_score,
+        elapsed_ms = start.elapsed().as_millis(),
+        "Simulation complete"
+    );
 
     let response = ApiSimulationResponse::from_output(output, warnings, request_id);
     Ok(Json(response))
@@ -311,10 +363,20 @@ async fn compare_handler(
         return Err((StatusCode::BAD_REQUEST, "candidates are required".to_string()));
     }
 
+    let compare_start = Instant::now();
+    info!(
+        candidate_count = request.candidates.len(),
+        scoring_mode = ?request.scoring_mode,
+        "Compare request received"
+    );
     let scoring_config = state.scoring_config.read().await.clone();
     let mut responses = Vec::new();
 
     for mut candidate in request.candidates {
+        let request_id = candidate
+            .request_id
+            .clone()
+            .unwrap_or_else(generate_request_id);
         if candidate.scoring_mode.is_none() {
             candidate.scoring_mode = request.scoring_mode.clone();
         }
@@ -350,9 +412,14 @@ async fn compare_handler(
         let mut scoring_mode = resolve_scoring_mode(&candidate, &scoring_config, &mut warnings);
         let mut phoenix_actions = None;
         if matches!(scoring_mode, ScoringMode::Phoenix | ScoringMode::Hybrid { .. }) {
-            match fetch_phoenix_actions(&state, &scoring_config, &mut input, &candidate).await {
+            match fetch_phoenix_actions(&state, &scoring_config, &mut input, &candidate, &request_id)
+                .await
+            {
                 Ok(actions) => phoenix_actions = Some(actions),
-                Err(err) => warnings.push(format!("Phoenix scoring failed: {}", err)),
+                Err(err) => {
+                    warn!(request_id = %request_id, error = %err, "Phoenix scoring failed");
+                    warnings.push(format!("Phoenix scoring failed: {}", err));
+                }
             }
         }
 
@@ -372,10 +439,6 @@ async fn compare_handler(
             &scoring_config,
         );
 
-        let request_id = candidate
-            .request_id
-            .clone()
-            .unwrap_or_else(generate_request_id);
         let response = ApiSimulationResponse::from_output(output, warnings, request_id);
         responses.push(response);
     }
@@ -386,7 +449,7 @@ async fn compare_handler(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
-    let results = responses
+    let results: Vec<CompareResult> = responses
         .into_iter()
         .enumerate()
         .map(|(idx, response)| CompareResult {
@@ -395,6 +458,11 @@ async fn compare_handler(
         })
         .collect();
 
+    info!(
+        candidate_count = results.len(),
+        elapsed_ms = compare_start.elapsed().as_millis(),
+        "Compare request complete"
+    );
     Ok(Json(CompareResponse { results }))
 }
 
@@ -539,6 +607,7 @@ async fn fetch_phoenix_actions(
     scoring_config: &ScoringConfig,
     input: &mut SimulatorInput,
     request: &ApiSimulationRequest,
+    request_id: &str,
 ) -> Result<ActionProbs, String> {
     let client = PhoenixClient::from_config(scoring_config)?;
     let (post_id, author_id) = ensure_candidate_ids(input);
@@ -547,6 +616,14 @@ async fn fetch_phoenix_actions(
     let user_id = derive_user_id(input, request);
     let (history_posts, history_actions) =
         build_history(state, &user_id, input, scoring_config.phoenix.history_limit).await?;
+    info!(
+        request_id = %request_id,
+        user_id = %user_id,
+        post_id = %post_id,
+        author_id = %author_id,
+        history_len = history_posts.len(),
+        "Sending Phoenix ranking request"
+    );
     let ranking_request = RankingRequest {
         user_id,
         user_embedding: None,
@@ -555,7 +632,13 @@ async fn fetch_phoenix_actions(
         candidates: vec![candidate],
     };
 
+    let start = Instant::now();
     let response = client.score(ranking_request).await?;
+    info!(
+        request_id = %request_id,
+        elapsed_ms = start.elapsed().as_millis(),
+        "Phoenix response received"
+    );
     let score = response
         .scores
         .iter()
@@ -575,6 +658,10 @@ async fn build_history(
     let seed = stable_hash64(user_id);
 
     if profile.is_none() {
+        info!(
+            user_id = %user_id,
+            "User profile missing; generating synthetic history"
+        );
         let mut new_profile = profile_from_input(user_id.to_string(), input);
         new_profile.engagement_history = generate_synthetic_history(&new_profile, seed);
         state.user_profiles.upsert(new_profile.clone()).await?;
@@ -583,6 +670,10 @@ async fn build_history(
 
     let mut profile = profile.expect("profile must be initialized");
     if profile.engagement_history.is_empty() {
+        info!(
+            user_id = %user_id,
+            "User profile had empty history; generating synthetic history"
+        );
         profile.engagement_history = generate_synthetic_history(&profile, seed);
         state.user_profiles.upsert(profile.clone()).await?;
     }
@@ -611,6 +702,11 @@ async fn build_history(
         .map(|event| action_flags_to_vector(&event.actions))
         .collect();
 
+    debug!(
+        user_id = %user_id,
+        history_len = history.len(),
+        "Prepared Phoenix history payload"
+    );
     Ok((history_posts, history_actions))
 }
 

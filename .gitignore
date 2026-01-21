@@ -10,3 +10,8 @@ webapp/.vite/
 .tldrignore
 .claude/tsc-cache/
 .claude/cache/
+output/
+target/
+**/.DS_Store
+.idea/
+.vscode/

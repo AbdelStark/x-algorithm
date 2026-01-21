@@ -133,9 +133,22 @@ async fn run() -> Result<(), String> {
 
     match command {
         Command::Simulate(args) => run_simulate(args).await,
-        Command::Serve(args) => server::serve(args).await,
+        Command::Serve(args) => {
+            init_tracing();
+            server::serve(args).await
+        }
         Command::Calibrate(args) => run_calibrate(args).await,
     }
+}
+
+fn init_tracing() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(true)
+        .with_level(true)
+        .try_init();
 }
 
 async fn run_simulate(args: SimulateArgs) -> Result<(), String> {

@@ -29,4 +29,16 @@ jobs:
         run: cargo test -q
 
       - name: Run e2e script
-        run: bash scripts/e2e.sh
+        env:
+          E2E_LOG_DIR: ${{ github.workspace }}/e2e-artifacts/logs
+        run: |
+          set -euo pipefail
+          mkdir -p e2e-artifacts
+          bash scripts/e2e.sh --log-dir "$E2E_LOG_DIR" --verbose | tee e2e-artifacts/e2e-report.txt
+
+      - name: Upload e2e artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-artifacts
+          path: e2e-artifacts
