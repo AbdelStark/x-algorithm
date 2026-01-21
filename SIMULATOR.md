@@ -101,6 +101,20 @@ Long-term:
 
 ## Running the simulator
 
+All-in-one (Phoenix + simulator + webapp):
+```
+./scripts/dev.sh
+```
+Flags:
+- `--log-dir ./output/dev-logs` to save logs per run.
+- `--skip-uv-sync` or `--skip-npm-install` to skip dependency installs.
+
+Docker Compose:
+```
+docker compose up --build
+```
+Then open `http://localhost:5173` (webapp), `http://localhost:8787/api/health` (simulator), and `http://localhost:8000/docs` (Phoenix).
+
 CLI:
 ```
 cargo run -- --text "this is a banger" --followers 1000 --following 50
@@ -115,7 +129,14 @@ Then open `http://localhost:8787`.
 Phoenix service (optional):
 ```
 cd phoenix
-uvicorn service.server:app --reload --port 8000
+uv run uvicorn service.server:app --reload --port 8000
+```
+
+Webapp dev server (optional):
+```
+cd webapp
+npm install
+npm run dev -- --host 127.0.0.1 --port 5173
 ```
 
 Environment variables:

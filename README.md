@@ -35,6 +35,27 @@ We have eliminated every single hand-engineered feature and most heuristics from
 
 ---
 
+## Local Development
+
+Run the simulator, Phoenix service, and webapp together:
+```
+./scripts/dev.sh
+```
+
+Or via Docker Compose:
+```
+docker compose up --build
+```
+
+Endpoints:
+- Webapp: `http://localhost:5173`
+- Simulator API: `http://localhost:8787/api/health`
+- Phoenix docs: `http://localhost:8000/docs`
+
+For simulator details and configuration, see `SIMULATOR.md`.
+
+---
+
 ## System Architecture
 
 ```
