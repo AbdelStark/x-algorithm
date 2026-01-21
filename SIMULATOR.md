@@ -65,7 +65,7 @@ What it does not do:
 No bullshit: this is a heuristic simulator with optional LLM assist. It is **not** a faithful reconstruction of the production ranking system because:
 - The real weights and prediction services are excluded from the open-source release.
 - There is no access to user graph, engagement history, or actual candidate sets.
-- The Phoenix model is not wired into the simulator.
+- The Phoenix model runs via an optional local service with synthetic embeddings and non-production weights.
 
 What it is good for:
 - Comparing drafts (A/B text variants).

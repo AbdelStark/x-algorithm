@@ -6,7 +6,7 @@ This document outlines a comprehensive plan to evolve the simulator from its cur
 
 ## Executive Summary
 
-**Current State:** The simulator uses hand-crafted heuristics to estimate engagement probabilities, with optional Grok LLM enhancement for text signals. It does not use the Phoenix ML models.
+**Current State:** The simulator uses hand-crafted heuristics with optional Grok LLM enhancement, and it can call the Phoenix ranking model via a local service. The 4-stage scoring pipeline (Phoenix → Weighted → Diversity → OON), configurable weights, user history, and calibration tooling are implemented.
 
 **Target State:** A simulator that:
 1. Runs the actual Phoenix JAX ranking model for engagement prediction
@@ -14,7 +14,7 @@ This document outlines a comprehensive plan to evolve the simulator from its cur
 3. Uses configurable, production-aligned weights
 4. Supports user engagement history for personalized predictions
 
-**Estimated Effort:** 4 phases over ~4-6 weeks of focused development
+**Estimated Effort:** Phases 1-4 implemented; remaining effort centers on data collection, retrieval integration, and validation.
 
 ---
 
@@ -24,11 +24,14 @@ This document outlines a comprehensive plan to evolve the simulator from its cur
 
 | Component | Location | Description |
 |-----------|----------|-------------|
-| Heuristic scorer | `simulator/src/lib.rs:304-512` | Text features → signals → action probabilities via sigmoid formulas |
+| Heuristic scorer | `simulator/src/lib.rs` | Text features → signals → action probabilities via sigmoid formulas |
 | LLM enhancement | `simulator/src/llm.rs` | Grok API for hook/clarity/novelty scoring |
-| 15 action types | `simulator/src/lib.rs:150-166` | ActionProbs struct with like, reply, repost, etc. |
-| Weighted score | `simulator/src/lib.rs:616-636` | Manual weights (repost=2.0, reply=1.6, block=-5.0) |
-| Impressions estimate | `simulator/src/lib.rs:445-464` | In-network + OON synthetic estimates |
+| Phoenix service + client | `phoenix/service/`, `simulator/src/phoenix_client.rs` | Optional Phoenix ranking model via local HTTP service |
+| 19 action types | `simulator/src/lib.rs` | ActionProbs aligned to Phoenix action taxonomy |
+| Scoring pipeline | `simulator/src/scoring/`, `config/scoring.toml` | Phoenix/heuristic → weighted → diversity → OON pipeline |
+| User profiles/history | `simulator/src/user/`, `simulator/src/server.rs` | Stored profiles + synthetic history for Phoenix requests |
+| Calibration CLI | `simulator/src/calibration/`, `docs/CALIBRATION.md` | Metrics, report output, and weight tuning |
+| Impressions estimate | `simulator/src/lib.rs` | In-network + OON synthetic estimates |
 
 ### What Production Has (From Open Source)
 
@@ -46,13 +49,12 @@ This document outlines a comprehensive plan to evolve the simulator from its cur
 
 | Gap | Severity | Impact |
 |-----|----------|--------|
-| Phoenix model not wired | Critical | Using heuristics instead of ML predictions |
-| Missing 4 action types | High | share_dm, share_link, vqv, quoted_click not modeled |
-| No author diversity | High | Feed diversity not simulated |
-| No OON scoring | High | In-network vs OON not differentiated |
-| No user history | High | No personalization context |
-| Heuristic weights | Medium | Weights are guesses, not production values |
-| No score normalization | Medium | Score scaling may differ from production |
+| Phoenix retrieval not integrated | High | Candidate generation remains simulated |
+| Production weights/embeddings missing | High | Scores cannot match production distributions |
+| Filters/hydrators not executed | High | Visibility, safety, and metadata logic omitted |
+| Calibration data volume missing | Medium | Accuracy vs production not validated |
+| Latency/throughput benchmarking | Medium | Performance targets not enforced |
+| Score normalization vs production | Medium | Final score scaling may differ |
 
 ---
 
@@ -113,13 +115,13 @@ class CandidateScore:
 
 @dataclass
 class PhoenixScores:
-    favorite: float
+    like: float
     reply: float
     repost: float
     photo_expand: float
     click: float
     profile_click: float
-    vqv: float
+    video_view: float
     share: float
     share_dm: float
     share_link: float
@@ -192,14 +194,14 @@ pub async fn simulate_with_ml(
 
 #### 1.4 Tasks
 
-- [ ] Create `phoenix/service/` directory structure
-- [ ] Implement FastAPI server with `/rank` endpoint
-- [ ] Add model loading using existing `RecsysInferenceRunner`
-- [ ] Create hash simulation for text → embedding lookup
-- [ ] Add Rust HTTP client in `simulator/src/phoenix_client.rs`
-- [ ] Update `server.rs` to optionally call Phoenix service
-- [ ] Add `PHOENIX_ENDPOINT` environment variable
-- [ ] Write integration tests
+- [x] Create `phoenix/service/` directory structure
+- [x] Implement FastAPI server with `/rank` endpoint
+- [x] Add model loading using existing `RecsysInferenceRunner`
+- [x] Create hash simulation for text → embedding lookup
+- [x] Add Rust HTTP client in `simulator/src/phoenix_client.rs`
+- [x] Update `server.rs` to optionally call Phoenix service
+- [x] Add `PHOENIX_ENDPOINT` environment variable
+- [x] Write integration tests
 
 ---
 
@@ -480,15 +482,15 @@ impl ScoringPipeline {
 
 #### 2.6 Tasks
 
-- [ ] Add 4 new action types to ActionProbs
-- [ ] Create `simulator/src/scoring/` module structure
-- [ ] Implement WeightedScorer with configurable weights
-- [ ] Implement AuthorDiversityScorer
-- [ ] Implement OONScorer
-- [ ] Create ScoringPipeline combining all scorers
-- [ ] Add configuration file support (`scoring_config.toml`)
-- [ ] Update API to expose individual stage scores
-- [ ] Update webapp to show stage-by-stage breakdown
+- [x] Add 4 new action types to ActionProbs
+- [x] Create `simulator/src/scoring/` module structure
+- [x] Implement WeightedScorer with configurable weights
+- [x] Implement AuthorDiversityScorer
+- [x] Implement OONScorer
+- [x] Create ScoringPipeline combining all scorers
+- [x] Add configuration file support (`config/scoring.toml`)
+- [x] Update API to expose individual stage scores
+- [x] Update webapp to show stage-by-stage breakdown
 
 ---
 
@@ -605,13 +607,13 @@ pub fn generate_synthetic_history(
 
 #### 3.4 Tasks
 
-- [ ] Create `simulator/src/user/` module
-- [ ] Implement UserProfile and EngagementEvent structs
-- [ ] Add user profile storage (JSON file initially)
-- [ ] Update Phoenix service to accept user history
-- [ ] Implement synthetic history generation
-- [ ] Add API endpoint for user profile management
-- [ ] Update webapp with "Simulate As User" feature
+- [x] Create `simulator/src/user/` module
+- [x] Implement UserProfile and EngagementEvent structs
+- [x] Add user profile storage (JSON file initially)
+- [x] Update Phoenix service to accept user history
+- [x] Implement synthetic history generation
+- [x] Add API endpoint for user profile management
+- [x] Update webapp with "Simulate As User" feature
 
 ---
 
@@ -713,13 +715,13 @@ pub struct CalibrationMetrics {
 
 #### 4.4 Tasks
 
-- [ ] Define CalibrationSample schema
-- [ ] Create calibration data collection guide
-- [ ] Implement CalibrationRunner
-- [ ] Implement WeightTuner with optimization
-- [ ] Add CLI command for calibration: `cargo run -- calibrate --data calibration.json`
-- [ ] Create validation report generator
-- [ ] Document calibration methodology
+- [x] Define CalibrationSample schema
+- [x] Create calibration data collection guide
+- [x] Implement CalibrationRunner
+- [x] Implement WeightTuner with optimization
+- [x] Add CLI command for calibration: `cargo run -- calibrate --data calibration.json`
+- [x] Create validation report generator
+- [x] Document calibration methodology
 
 ---
 
@@ -810,8 +812,8 @@ GET /api/users/{user_id}/history
   "score": 72.5,
   "tier": "High",
   "scoring_mode": "hybrid",
-  "phoenix_scores": {
-    "favorite": 0.15,
+  "phoenix_actions": {
+    "like": 0.15,
     "reply": 0.08,
     "repost": 0.12,
     "...": "..."
@@ -820,11 +822,11 @@ GET /api/users/{user_id}/history
   "diversity_multiplier": 1.0,
   "oon_multiplier": 1.0,
   "final_score": 1.45,
-  "impressions": {
-    "in_network": 450,
-    "oon": 1200,
-    "total": 1650
-  },
+  "impressions_in": 450,
+  "impressions_oon": 1200,
+  "impressions_total": 1650,
+  "expected_unique_engagements": 42,
+  "expected_action_volume": 65,
   "signals": { "..." },
   "suggestions": ["..."]
 }
@@ -847,22 +849,22 @@ GET /api/users/{user_id}/history
 ## Success Criteria
 
 ### Phase 1 Complete When:
-- [ ] Phoenix service runs and responds to requests
-- [ ] Simulator can optionally use Phoenix for scoring
+- [x] Phoenix service runs and responds to requests
+- [x] Simulator can optionally use Phoenix for scoring
 - [ ] Latency < 500ms for single-post scoring
 
 ### Phase 2 Complete When:
-- [ ] All 19 action types supported
-- [ ] 4-stage pipeline implemented
-- [ ] Webapp shows stage-by-stage breakdown
+- [x] All 19 action types supported
+- [x] 4-stage pipeline implemented
+- [x] Webapp shows stage-by-stage breakdown
 
 ### Phase 3 Complete When:
-- [ ] User profiles can be created and stored
-- [ ] Phoenix requests include user history
-- [ ] Scoring differs meaningfully for different user profiles
+- [x] User profiles can be created and stored
+- [x] Phoenix requests include user history
+- [x] Scoring differs meaningfully for different user profiles
 
 ### Phase 4 Complete When:
-- [ ] Calibration framework functional
+- [x] Calibration framework functional
 - [ ] At least 100 calibration samples collected
 - [ ] Pairwise ranking accuracy > 70%
 
@@ -913,16 +915,16 @@ PhoenixModelConfig(
 | video_view | vqv_score | Video Quality View |
 | photo_expand | photo_expand_score | Direct map |
 | share | share_score | Direct map |
-| - | share_via_dm_score | **New** |
-| - | share_via_copy_link_score | **New** |
+| share_dm | share_via_dm_score | Direct map |
+| share_link | share_via_copy_link_score | Direct map |
 | dwell | dwell_score | Direct map |
-| - | quoted_click_score | **New** |
+| quoted_click | quoted_click_score | Direct map |
 | follow_author | follow_author_score | Direct map |
 | not_interested | not_interested_score | Direct map |
 | block | block_author_score | Direct map |
 | mute | mute_author_score | Direct map |
 | report | report_score | Direct map |
-| - | dwell_time | **New** (continuous) |
+| dwell_time | dwell_time | Continuous (seconds) |
 
 ## Appendix C: File Structure After Implementation
 
@@ -965,13 +967,13 @@ phoenix/
 
 ## Next Steps
 
-1. **Immediate**: Review this plan and prioritize phases
-2. **Week 1-2**: Implement Phase 1 (Phoenix integration)
-3. **Week 3**: Implement Phase 2 (Scoring pipeline)
-4. **Week 4**: Implement Phase 3 (User context)
-5. **Ongoing**: Phase 4 (Calibration) as data becomes available
+1. **Immediate**: Collect calibration samples and validate metrics at scale.
+2. **Short-term**: Integrate candidate retrieval (Thunder + Phoenix retrieval) with real candidates.
+3. **Short-term**: Implement core hydrators/filters to mirror production eligibility rules.
+4. **Medium-term**: Validate latency/throughput targets for Phoenix service + simulator.
+5. **Ongoing**: Tune weights against calibration data and revisit score normalization.
 
 ---
 
-*Last updated: 2026-01-20*
+*Last updated: 2026-01-21*
 *Author: Claude (automated analysis)*
