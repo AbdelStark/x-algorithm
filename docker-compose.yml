@@ -1,0 +1,30 @@
+services:
+  phoenix:
+    build:
+      context: ./phoenix
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      PHOENIX_LOG_LEVEL: info
+
+  simulator:
+    build:
+      context: .
+      dockerfile: simulator/Dockerfile
+    ports:
+      - "8787:8787"
+    environment:
+      PHOENIX_ENDPOINT: http://phoenix:8000
+      RUST_LOG: info
+    depends_on:
+      - phoenix
+
+  webapp:
+    build:
+      context: .
+      dockerfile: webapp/Dockerfile
+    ports:
+      - "5173:80"
+    depends_on:
+      - simulator

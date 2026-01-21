@@ -1,6 +1,6 @@
 __pycache__/
 .env
-node_modules/
+**/node_modules/
 webapp/node_modules/
 webapp/dist/
 webapp/.vite/
@@ -15,3 +15,5 @@ target/
 **/.DS_Store
 .idea/
 .vscode/
+docs/videos/xalgo_explainer_video/out/
+docs/videos/xalgo_explainer_video/node_modules/

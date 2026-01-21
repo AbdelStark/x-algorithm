@@ -2215,9 +2215,9 @@ function simulateLocal(form: FormState): SimulationResult {
   const impressionsIn = form.followers * activeFraction * Math.max(0, 0.6 + 0.4 * audienceAlignment);
 
   const oonSeed = 300 + 1400 * positiveSignal;
-  const oonMultiplier = 1 + clamp01((weightedScore - 1) / 3) * 4;
+  const oonReachMultiplier = 1 + clamp01((weightedScore - 1) / 3) * 4;
   let impressionsOon =
-    oonSeed * oonMultiplier * (0.5 + 0.5 * contentQuality) * (1 - 0.7 * topicSaturation) * (1 - 0.5 * negativeRisk);
+    oonSeed * oonReachMultiplier * (0.5 + 0.5 * contentQuality) * (1 - 0.7 * topicSaturation) * (1 - 0.5 * negativeRisk);
   if (!Number.isFinite(impressionsOon) || impressionsOon < 0) impressionsOon = 0;
 
   const impressionsTotal = impressionsIn + impressionsOon;

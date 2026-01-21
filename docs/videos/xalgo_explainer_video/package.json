@@ -1,0 +1,25 @@
+{
+  "name": "xalgo-explainer-video",
+  "version": "1.0.0",
+  "description": "Animated explainer video for the X algorithm",
+  "scripts": {
+    "dev": "npx remotion studio",
+    "build": "npm run render",
+    "render": "npx remotion render XAlgoExplainer out/xalgo-explainer.mp4",
+    "preview": "npx remotion preview"
+  },
+  "dependencies": {
+    "@remotion/cli": "^4.0.0",
+    "@remotion/tailwind": "^4.0.0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "remotion": "^4.0.0"
+  },
+  "devDependencies": {
+    "@types/react": "^18.2.0",
+    "typescript": "^5.0.0",
+    "tailwindcss": "^3.4.0",
+    "autoprefixer": "^10.4.0",
+    "postcss": "^8.4.0"
+  }
+}
